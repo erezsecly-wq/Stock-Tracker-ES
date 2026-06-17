@@ -61,8 +61,8 @@ export default function App() {
 
   // Base typography font size scaling: 13 to 22px
   const [fontSize, setFontSize] = useState<number>(() => {
-    const saved = localStorage.getItem("font_size");
-    return saved ? Math.max(16, parseInt(saved)) : 18; // Larger, comfortable default
+    const saved = localStorage.getItem("font_size_v2");
+    return saved ? parseInt(saved) : 20; // Significantly larger, crisp default
   });
 
   // Sound enabled mute value
@@ -462,7 +462,7 @@ export default function App() {
       inputBg = interpolateColor("#000000", "#1c1e26", ratio);
       // Hard bright white (לבן בוהק) for premium, clean legibility as requested!
       textPrimary = "#ffffff"; 
-      textMutedColor = "#f1f5f9"; // high-contrast light grey/white, not slate-400 opacity!
+      textMutedColor = "#ffffff"; // pure white in dark mode (no faded grey)
       chartRef = interpolateColor("#17181c", "#343847", ratio);
     } else {
       const ratio = (val - 50) / 50; // 0 to 1
@@ -573,13 +573,19 @@ export default function App() {
         }
         /* Bright white override for dark mode text items to remove annoying slate transparency */
         ${themeVal < 50 ? `
-          #dashboard_core .text-slate-300, 
-          #dashboard_core .text-slate-400, 
-          #dashboard_core .text-slate-550, 
-          #dashboard_core .text-slate-205, 
-          #dashboard_core .text-slate-350, 
-          #dashboard_core .text-slate-500 {
+          #dashboard_core .text-slate-200,
+          #dashboard_core .text-slate-300,
+          #dashboard_core .text-slate-350,
+          #dashboard_core .text-slate-400,
+          #dashboard_core .text-slate-450,
+          #dashboard_core .text-slate-500,
+          #dashboard_core .text-slate-550,
+          #dashboard_core .text-slate-600,
+          #dashboard_core .text-gray-300,
+          #dashboard_core .text-gray-400,
+          #dashboard_core .text-gray-500 {
             color: #ffffff !important;
+            opacity: 1 !important;
           }
         ` : ""}
       `}</style>
@@ -680,7 +686,7 @@ export default function App() {
                   onChange={(e) => {
                     const val = parseInt(e.target.value);
                     setFontSize(val);
-                    localStorage.setItem("font_size", String(val));
+                    localStorage.setItem("font_size_v2", String(val));
                   }}
                   className="w-full h-1 bg-slate-400/30 rounded-lg appearance-none cursor-pointer accent-cyan-500 focus:outline-none"
                   style={{ direction: 'ltr' }}

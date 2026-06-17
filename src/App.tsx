@@ -1424,6 +1424,7 @@ export default function App() {
             theme={theme}
             themeVal={themeVal}
             token={session.token}
+            stocks={stocks}
           />
         )}
 

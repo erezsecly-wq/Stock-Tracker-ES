@@ -87,6 +87,8 @@ interface BotState {
   takeProfitPct: number;       // sell if price rises this % above avg cost (0 = use sellLimit only)
   maxLotsPerTicker: number;    // cap accumulation per ticker
   startedAt: string | null;
+  adaptive: boolean;            // auto-learn & adjust thresholds to the market
+  lastAdaptAt: string | null;
   tickers: { [ticker: string]: BotTickerConfig };
   holdings: { [ticker: string]: { shares: number; avgBuyPrice: number } };
   trades: BotTrade[];
@@ -446,6 +448,8 @@ function makeDefaultBot(startingCapital = 5000): BotState {
     takeProfitPct: 0,
     maxLotsPerTicker: 3,
     startedAt: null,
+    adaptive: false,
+    lastAdaptAt: null,
     tickers: {},
     holdings: {},
     trades: [],
@@ -537,6 +541,40 @@ function runTradingEngine() {
       }
       if (Object.keys(basis).length > 0) {
         bot.benchmarkBasis = basis;
+        anyChange = true;
+      }
+    }
+
+    // Adaptive thresholds: periodically re-learn buy/sell limits from recent
+    // market behaviour (trend + volatility) so the bot adjusts to the market.
+    if (bot.adaptive) {
+      const sinceAdapt = bot.lastAdaptAt ? now.getTime() - new Date(bot.lastAdaptAt).getTime() : Infinity;
+      if (sinceAdapt >= 60000) {
+        bot.lastAdaptAt = now.toISOString();
+        for (const cfg of Object.values(bot.tickers)) {
+          if (!cfg.enabled) continue;
+          const st = stocks.find(s => s.ticker === cfg.ticker);
+          if (!st || st.history.length < 3) continue;
+          const hist = st.history.map(h => h.price);
+          const first = hist[0];
+          const cur = st.currentPrice;
+          const trend = (cur - first) / first;
+          const hi = Math.max(...hist), lo = Math.min(...hist);
+          const vol = lo > 0 ? (hi - lo) / lo : 0;
+          let buyPct = 0.03, sellPct = 0.05;
+          if (trend < -0.01) {                 // downtrend: buy deeper dips, take profit sooner
+            buyPct = Math.min(0.10, 0.05 + Math.abs(trend));
+            sellPct = 0.035;
+          } else if (trend > 0.01) {           // uptrend: buy shallow dips, let winners run
+            buyPct = 0.02;
+            sellPct = Math.min(0.12, 0.06 + trend);
+          } else {                              // flat: tighten ranges in low volatility
+            buyPct = vol < 0.02 ? 0.015 : 0.03;
+            sellPct = vol < 0.02 ? 0.022 : 0.05;
+          }
+          cfg.buyLimit = parseFloat((cur * (1 - buyPct)).toFixed(2));
+          cfg.sellLimit = parseFloat((cur * (1 + sellPct)).toFixed(2));
+        }
         anyChange = true;
       }
     }
@@ -1181,6 +1219,7 @@ app.get("/api/bot", authMiddleware, (req, res) => {
       stopLossPct: bot.stopLossPct,
       takeProfitPct: bot.takeProfitPct,
       maxLotsPerTicker: bot.maxLotsPerTicker,
+      adaptive: bot.adaptive,
       startedAt: bot.startedAt,
       tickers: Object.values(bot.tickers)
     },
@@ -1207,6 +1246,7 @@ app.post("/api/bot/config", authMiddleware, (req, res) => {
   if (typeof b.stopLossPct === "number") bot.stopLossPct = Math.min(90, Math.max(0, b.stopLossPct));
   if (typeof b.takeProfitPct === "number") bot.takeProfitPct = Math.min(500, Math.max(0, b.takeProfitPct));
   if (typeof b.maxLotsPerTicker === "number") bot.maxLotsPerTicker = Math.min(20, Math.max(1, Math.floor(b.maxLotsPerTicker)));
+  if (typeof b.adaptive === "boolean") bot.adaptive = b.adaptive;
 
   if (Array.isArray(b.tickers)) {
     for (const t of b.tickers) {

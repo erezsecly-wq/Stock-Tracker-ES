@@ -15,6 +15,7 @@ interface ServerBotProps {
   theme: any;
   themeVal: number;
   token: string;
+  stocks: { ticker: string; currentPrice: number }[];
 }
 
 interface TickerCfg {
@@ -33,6 +34,7 @@ interface BotData {
     stopLossPct: number;
     takeProfitPct: number;
     maxLotsPerTicker: number;
+    adaptive: boolean;
     startedAt: string | null;
     tickers: TickerCfg[];
   };
@@ -59,7 +61,7 @@ interface Metrics {
   enabled: boolean;
 }
 
-export default function ServerBot({ theme, themeVal, token }: ServerBotProps) {
+export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotProps) {
   const [data, setData] = useState<BotData | null>(null);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [saving, setSaving] = useState(false);
@@ -71,6 +73,7 @@ export default function ServerBot({ theme, themeVal, token }: ServerBotProps) {
   const [stopLossPct, setStopLossPct] = useState(8);
   const [takeProfitPct, setTakeProfitPct] = useState(0);
   const [brokerCommission, setBrokerCommission] = useState(1.0);
+  const [adaptive, setAdaptive] = useState(false);
   const [tickers, setTickers] = useState<TickerCfg[]>([]);
   const [loadedOnce, setLoadedOnce] = useState(false);
 
@@ -91,6 +94,7 @@ export default function ServerBot({ theme, themeVal, token }: ServerBotProps) {
           setStopLossPct(b.config.stopLossPct);
           setTakeProfitPct(b.config.takeProfitPct);
           setBrokerCommission(b.config.brokerCommission);
+          setAdaptive(!!b.config.adaptive);
           setTickers(b.config.tickers);
           setLoadedOnce(true);
         }
@@ -123,7 +127,7 @@ export default function ServerBot({ theme, themeVal, token }: ServerBotProps) {
         headers: { "Content-Type": "application/json", ...auth },
         body: JSON.stringify({
           startingCapital, positionSizePct, stopLossPct,
-          takeProfitPct, brokerCommission, tickers
+          takeProfitPct, brokerCommission, adaptive, tickers
         })
       });
       if (res.ok) flash("ההגדרות נשמרו בהצלחה");
@@ -148,6 +152,18 @@ export default function ServerBot({ theme, themeVal, token }: ServerBotProps) {
 
   const setTickerField = (ticker: string, field: keyof TickerCfg, value: any) => {
     setTickers(prev => prev.map(t => t.ticker === ticker ? { ...t, [field]: value } : t));
+  };
+
+  const selectAll = (on: boolean) => setTickers(prev => prev.map(t => ({ ...t, enabled: on })));
+
+  // "Smart thresholds": set buy/sell limits from the current live price (-3% / +6%)
+  const smartThresholds = () => {
+    setTickers(prev => prev.map(t => {
+      const p = stocks.find(s => s.ticker === t.ticker)?.currentPrice;
+      if (!p) return t;
+      return { ...t, buyLimit: parseFloat((p * 0.97).toFixed(2)), sellLimit: parseFloat((p * 1.06).toFixed(2)) };
+    }));
+    flash("הוגדרו ספים חכמים לפי המחיר הנוכחי (קנייה -3%, מכירה +6%)");
   };
 
   const running = data?.config.enabled;
@@ -240,6 +256,15 @@ export default function ServerBot({ theme, themeVal, token }: ServerBotProps) {
               <input type="number" step="0.1" className={input} value={brokerCommission}
                 onChange={e => setBrokerCommission(parseFloat(e.target.value) || 0)} />
             </div>
+            <label className={`flex items-center justify-between gap-2 p-2.5 rounded-xl border ${theme.border} ${theme.subCard} cursor-pointer`}>
+              <span className="text-xs font-bold">🧠 ספים אדפטיביים (לומד ומסתגל לשוק)</span>
+              <input type="checkbox" checked={adaptive} onChange={e => setAdaptive(e.target.checked)} className="accent-cyan-500 w-5 h-5" />
+            </label>
+            {adaptive && (
+              <p className={`text-[11px] ${theme.textMuted} leading-relaxed`}>
+                כשמופעל, הבוט מנתח מגמה ותנודתיות אחת לדקה ומעדכן אוטומטית את ספי הקנייה/מכירה לכל מניה מופעלת.
+              </p>
+            )}
           </div>
           <button onClick={saveConfig} disabled={saving}
             className="w-full flex items-center justify-center gap-2 py-2.5 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold rounded-xl text-sm transition-all active:scale-95">
@@ -253,7 +278,14 @@ export default function ServerBot({ theme, themeVal, token }: ServerBotProps) {
 
         {/* Tickers config */}
         <div className={`${card} lg:col-span-2 space-y-3`}>
-          <h4 className={`text-sm font-bold ${themeVal >= 70 ? "text-slate-900" : "text-slate-100"}`}>מניות במעקב הבוט וספי קנייה/מכירה</h4>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h4 className={`text-sm font-bold ${themeVal >= 70 ? "text-slate-900" : "text-slate-100"}`}>מניות במעקב הבוט וספי קנייה/מכירה</h4>
+            <div className="flex items-center gap-2">
+              <button onClick={() => selectAll(true)} className={`text-[11px] font-bold py-1.5 px-2.5 rounded-lg border ${theme.border} ${theme.subCard} hover:opacity-80`}>בחר הכל</button>
+              <button onClick={() => selectAll(false)} className={`text-[11px] font-bold py-1.5 px-2.5 rounded-lg border ${theme.border} ${theme.subCard} hover:opacity-80`}>נקה הכל</button>
+              <button onClick={smartThresholds} className="text-[11px] font-bold py-1.5 px-2.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950">⚡ ספים חכמים</button>
+            </div>
+          </div>
           <div className="space-y-2 max-h-[360px] overflow-y-auto pr-1">
             {tickers.map(t => (
               <div key={t.ticker} className={`p-3 rounded-2xl border ${theme.border} ${theme.subCard} flex flex-wrap items-center gap-3`}>

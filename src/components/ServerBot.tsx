@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   Cpu, Play, Square, RefreshCw, TrendingUp, TrendingDown, ShieldAlert,
-  Activity, DollarSign, Save
+  Activity, DollarSign, Save, Wifi
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -76,6 +76,7 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
   const [adaptive, setAdaptive] = useState(false);
   const [tickers, setTickers] = useState<TickerCfg[]>([]);
   const [loadedOnce, setLoadedOnce] = useState(false);
+  const [liveFeed, setLiveFeed] = useState(false);
 
   const auth = { Authorization: `Bearer ${token}` };
 
@@ -103,6 +104,8 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
         const m = await mRes.json();
         setMetrics(m.metrics);
       }
+      const lf = await fetch("/api/config/live-feed");
+      if (lf.ok) setLiveFeed(!!(await lf.json()).useLiveFeed);
     } catch (e) {
       console.error("bot load error", e);
     }
@@ -150,6 +153,23 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
     load();
   };
 
+  // Live Feed: connect the engine to REAL market prices (Yahoo Finance).
+  // Trades remain simulated (paper) but now react to the real market.
+  const toggleLiveFeed = async () => {
+    const next = !liveFeed;
+    const res = await fetch("/api/config/live-feed", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: next })
+    });
+    if (res.ok) {
+      setLiveFeed(next);
+      flash(next
+        ? "📡 מחוברים למחירי שוק אמיתיים (Yahoo Finance) — מסחר מדומה לפי השוק האמיתי"
+        : "🔌 חזרה למצב סימולציה (מחירים מדומים)");
+    }
+  };
+
   const setTickerField = (ticker: string, field: keyof TickerCfg, value: any) => {
     setTickers(prev => prev.map(t => t.ticker === ticker ? { ...t, [field]: value } : t));
   };
@@ -194,6 +214,12 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <button onClick={toggleLiveFeed}
+            className={`flex items-center gap-2 py-2.5 px-4 rounded-xl border text-sm font-bold transition-all ${liveFeed ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-400" : `${theme.border} ${theme.subCard}`}`}
+            title="חבר/נתק מחירי שוק אמיתיים (Yahoo Finance)">
+            <Wifi className={`w-4 h-4 ${liveFeed ? "text-emerald-400" : ""}`} />
+            {liveFeed ? "מחירים אמיתיים (LIVE)" : "מצב סימולציה"}
+          </button>
           <button onClick={load} className={`p-2.5 rounded-xl border ${theme.border} ${theme.subCard} hover:opacity-80`} title="רענן">
             <RefreshCw className="w-4 h-4" />
           </button>

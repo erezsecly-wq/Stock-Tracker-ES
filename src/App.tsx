@@ -16,6 +16,8 @@ import { Scale, Cpu } from "lucide-react";
 import { playAlertSound } from "./utils/audio";
 import LearningHub from "./components/LearningHub";
 import AutoSimulator from "./components/AutoSimulator";
+import { registerBiometric } from "./utils/webauthn";
+import ServerBot from "./components/ServerBot";
 
 // Helper to compute timeframe-based history for stock chart.
 // When selecting 1W or 1M, we generate a high-quality deterministic walk based on ticker and current prices
@@ -89,7 +91,7 @@ export default function App() {
   } | null>(null);
 
   // Tabs / Active View
-  const [activeTab, setActiveTab] = useState<"market" | "portfolio" | "logs" | "settings" | "compare" | "education" | "autosim">("market");
+  const [activeTab, setActiveTab] = useState<"market" | "portfolio" | "logs" | "settings" | "compare" | "education" | "autosim" | "serverbot">("market");
 
   // Core Data
   const [stocks, setStocks] = useState<StockInfo[]>([]);
@@ -335,29 +337,20 @@ export default function App() {
     }, 10000);
   };
 
-  // Callback to register biometrics
+  // Callback to register biometrics — performs a REAL WebAuthn registration
+  // ceremony (native fingerprint/face prompt + server-side public-key storage).
+  const [bioError, setBioError] = useState<string | null>(null);
   const handleRegisterBiometrics = async () => {
     if (!session) return;
+    setBioError(null);
     try {
-      const res = await fetch("/api/auth/biometric/register", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${session.token}`
-        },
-        body: JSON.stringify({
-          username: session.username,
-          credentialId: `webauthn_${Math.random().toString(36).substring(2)}`
-        })
-      });
-
-      if (res.ok) {
-        localStorage.setItem(`bio_reg_${session.username}`, "true");
-        setSession(prev => prev ? { ...prev, biometricRegistered: true } : null);
-        setShowRegisterBioModel(false);
-      }
-    } catch (err) {
+      await registerBiometric(session.token);
+      localStorage.setItem(`bio_reg_${session.username}`, "true");
+      setSession(prev => prev ? { ...prev, biometricRegistered: true } : null);
+      setShowRegisterBioModel(false);
+    } catch (err: any) {
       console.error("Biometric registration failed", err);
+      setBioError(err?.message || "רישום ביומטרי נכשל. ודא שהמכשיר תומך בטביעת אצבע/פנים.");
     }
   };
 
@@ -841,6 +834,15 @@ export default function App() {
             >
               <Cpu className="w-4.5 h-4.5 text-cyan-400 animate-spin" style={{ animationDuration: '6s' }} />
               🤖 סימולטור 60 יום מואץ
+            </button>
+            <button
+              onClick={() => setActiveTab("serverbot")}
+              className={`pb-4 text-sm font-bold border-b-2 transition-all flex items-center gap-1.5
+                ${activeTab === "serverbot" ? theme.tabActive : tabInactive}
+              `}
+            >
+              <Cpu className="w-4.5 h-4.5 text-emerald-400" />
+              🟢 בוט מסחר 24/7 (שרת)
             </button>
           </nav>
         </div>
@@ -1423,6 +1425,14 @@ export default function App() {
           </div>
         )}
 
+        {activeTab === "serverbot" && (
+          <ServerBot
+            theme={theme}
+            themeVal={themeVal}
+            token={session.token}
+          />
+        )}
+
       </main>
 
       {/* Gemini AI analysis slide modal drawer */}
@@ -1447,12 +1457,17 @@ export default function App() {
               ✕
             </button>
             <div className="p-2">
-              <FingerprintSensor 
+              <FingerprintSensor
                 onSuccess={handleRegisterBiometrics}
                 onCancel={() => setShowRegisterBioModel(false)}
                 title="סריקת טביעת אצבע לרישום"
                 subtitle="אבטח את החשבון לחיבור מהיר בלחיצה אחת בפעם הבאה"
               />
+              {bioError && (
+                <div className="mt-3 p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 text-rose-400 text-xs text-center">
+                  {bioError}
+                </div>
+              )}
             </div>
           </div>
         </div>

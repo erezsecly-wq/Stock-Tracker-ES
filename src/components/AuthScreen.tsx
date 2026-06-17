@@ -1,6 +1,7 @@
 import { useState, useEffect, FormEvent } from "react";
 import { Lock, User, Sparkles, Fingerprint, ShieldCheck, AlertCircle } from "lucide-react";
 import FingerprintSensor from "./FingerprintSensor";
+import { loginBiometric } from "../utils/webauthn";
 
 interface AuthScreenProps {
   onLoginSuccess: (username: string, token: string, biometricRegistered: boolean) => void;
@@ -104,19 +105,11 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
     setLoading(true);
 
     try {
-      const res = await fetch("/api/auth/biometric/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: lastUsername })
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "זיהוי ביומטרי נכשל");
-      }
-
+      // Real WebAuthn assertion: native biometric prompt + signed challenge
+      const data = await loginBiometric(lastUsername);
       onLoginSuccess(data.username, data.token, true);
     } catch (err: any) {
-      setErrorMsg(err.message);
+      setErrorMsg(err.message || "זיהוי ביומטרי נכשל");
       setShowBioSensor(false);
     } finally {
       setLoading(false);

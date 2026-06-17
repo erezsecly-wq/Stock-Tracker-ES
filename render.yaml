@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: stockwise-es
+    runtime: node
+    plan: starter            # paid tier that does NOT sleep (required for 24/7)
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true   # Render generates a strong secret
+      - key: RP_ID
+        sync: false           # set to your render domain, e.g. stockwise-es.onrender.com
+      - key: ORIGIN
+        sync: false           # set to https://<your-domain>
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DB_FILE
+        value: /var/data/data_store.json
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1

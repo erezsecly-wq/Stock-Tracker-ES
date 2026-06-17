@@ -1,28 +1,107 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import rateLimit from "express-rate-limit";
+import {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse,
+} from "@simplewebauthn/server";
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+app.set("trust proxy", 1); // needed for correct rate-limit behind hosting proxies (Render/Railway)
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
+// ---------------------------------------------------------------------------
+// Security / deployment configuration (all overridable via environment vars)
+// ---------------------------------------------------------------------------
+// JWT secret: MUST be set in production. A random per-boot secret is used as a
+// safe fallback in dev (invalidates tokens on restart, which is acceptable locally).
+const JWT_SECRET =
+  process.env.JWT_SECRET || crypto.randomBytes(48).toString("hex");
+if (!process.env.JWT_SECRET) {
+  console.warn(
+    "[security] JWT_SECRET not set - using a random per-boot secret. Set JWT_SECRET in production!"
+  );
+}
+const TOKEN_TTL = "7d";
+
+// WebAuthn relying-party config. For local dev these defaults work as-is.
+// In production set RP_ID to your domain (e.g. 'myapp.com') and ORIGIN to the
+// full https origin (e.g. 'https://myapp.com').
+const RP_ID = process.env.RP_ID || "localhost";
+const RP_NAME = process.env.RP_NAME || "StockWise ES";
+const ORIGIN = process.env.ORIGIN || `http://localhost:${PORT}`;
+
 // Path to file-based persistent DB
-const DB_FILE = path.join(process.cwd(), "data_store.json");
+const DB_FILE = process.env.DB_FILE || path.join(process.cwd(), "data_store.json");
+
+// A registered WebAuthn (passkey / biometric) credential
+interface StoredCredential {
+  id: string;              // base64url credential ID
+  publicKey: string;       // base64url COSE public key
+  counter: number;         // signature counter (replay protection)
+  transports?: string[];
+  createdAt: string;
+}
+
+// Per-ticker configuration for the server-side autonomous trading engine
+interface BotTickerConfig {
+  ticker: string;
+  enabled: boolean;
+  buyLimit: number;   // buy when price <= buyLimit
+  sellLimit: number;  // take profit when price >= sellLimit
+}
+
+interface BotTrade {
+  id: string;
+  timestamp: string;
+  ticker: string;
+  type: "BUY" | "SELL";
+  shares: number;
+  price: number;
+  total: number;       // cash impact incl. fee
+  fee: number;
+  profit?: number;     // realized P&L for SELL
+  reason: string;      // why the engine acted (limit / stop-loss / take-profit)
+}
+
+interface BotState {
+  enabled: boolean;            // is the autonomous engine running for this user
+  startingCapital: number;
+  cash: number;
+  brokerCommission: number;    // fee per trade ($)
+  positionSizePct: number;     // % of equity to deploy per BUY (e.g. 10 = 10%)
+  stopLossPct: number;         // sell if price falls this % below avg cost (0 = off)
+  takeProfitPct: number;       // sell if price rises this % above avg cost (0 = use sellLimit only)
+  maxLotsPerTicker: number;    // cap accumulation per ticker
+  startedAt: string | null;
+  tickers: { [ticker: string]: BotTickerConfig };
+  holdings: { [ticker: string]: { shares: number; avgBuyPrice: number } };
+  trades: BotTrade[];
+  equityCurve: { t: string; equity: number }[]; // periodic equity snapshots
+  benchmarkBasis: { [ticker: string]: number } | null; // start prices for buy&hold benchmark
+}
 
 // Structure of persistent database
 interface DatabaseSchema {
   users: {
     [username: string]: {
       passwordHash: string;
-      biometricRegistered?: boolean;
-      biometricCredentialId?: string;
-      accessToken?: string;
+      createdAt: string;
+      currentChallenge?: string;        // transient WebAuthn challenge
+      credentials: StoredCredential[];  // registered passkeys
     }
   };
   alerts: {
@@ -55,6 +134,9 @@ interface DatabaseSchema {
       read: boolean;
     }[]
   };
+  bots: {
+    [username: string]: BotState;
+  };
 }
 
 // Initial default database structure
@@ -62,7 +144,8 @@ const initialDB: DatabaseSchema = {
   users: {},
   alerts: {},
   portfolios: {},
-  logs: {}
+  logs: {},
+  bots: {}
 };
 
 // Seed stock data
@@ -287,26 +370,88 @@ const stocks: Stock[] = [
   }
 ];
 
-// Helper to load database
-function loadDB(): DatabaseSchema {
+// ---------------------------------------------------------------------------
+// Persistence: a SINGLE in-memory DB is the source of truth (loaded once at
+// boot). All requests mutate this object directly, which eliminates the
+// read-modify-write race that the old per-request loadDB()/saveDB() pattern
+// suffered from in a single-threaded Node process. Writes to disk are atomic
+// (write to a temp file, then rename) and debounced.
+// ---------------------------------------------------------------------------
+function readDBFromDisk(): DatabaseSchema {
   try {
     if (fs.existsSync(DB_FILE)) {
       const data = fs.readFileSync(DB_FILE, "utf-8");
-      return JSON.parse(data);
+      const parsed = JSON.parse(data) as Partial<DatabaseSchema>;
+      // Merge with defaults so older files missing new collections still load
+      return {
+        users: parsed.users || {},
+        alerts: parsed.alerts || {},
+        portfolios: parsed.portfolios || {},
+        logs: parsed.logs || {},
+        bots: parsed.bots || {}
+      };
     }
   } catch (err) {
     console.error("Error reading database file", err);
   }
-  return initialDB;
+  return JSON.parse(JSON.stringify(initialDB));
 }
 
-// Helper to save database
-function saveDB(data: DatabaseSchema) {
+const db: DatabaseSchema = readDBFromDisk();
+
+let persistTimer: NodeJS.Timeout | null = null;
+let persistPending = false;
+
+function flushDB() {
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+    const tmp = `${DB_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(db, null, 2), "utf-8");
+    fs.renameSync(tmp, DB_FILE); // atomic on the same filesystem
   } catch (err) {
     console.error("Error writing to database file", err);
   }
+  persistPending = false;
+}
+
+// Debounced atomic persist (coalesces bursts of writes into one disk write)
+function persist() {
+  persistPending = true;
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    if (persistPending) flushDB();
+  }, 400);
+}
+
+// Persist synchronously on shutdown so nothing is lost
+function persistNow() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  flushDB();
+}
+process.on("SIGINT", () => { persistNow(); process.exit(0); });
+process.on("SIGTERM", () => { persistNow(); process.exit(0); });
+
+// Build a fresh default bot state for a new user
+function makeDefaultBot(startingCapital = 5000): BotState {
+  return {
+    enabled: false,
+    startingCapital,
+    cash: startingCapital,
+    brokerCommission: 1.0,
+    positionSizePct: 15,
+    stopLossPct: 8,
+    takeProfitPct: 0,
+    maxLotsPerTicker: 3,
+    startedAt: null,
+    tickers: {},
+    holdings: {},
+    trades: [],
+    equityCurve: [],
+    benchmarkBasis: null
+  };
 }
 
 // Global flag for connecting to real-market free provider (Yahoo Finance)
@@ -355,21 +500,167 @@ async function updateStocksFromYahoo() {
   }
 }
 
-// Start simulated stock fluctuations or fetch real Yahoo Finance live values, and alert trigger evaluation
+function priceOf(ticker: string): number | null {
+  const s = stocks.find(st => st.ticker === ticker);
+  return s ? s.currentPrice : null;
+}
+
+// Total equity (cash + market value of holdings) for a bot
+function botEquity(bot: BotState): number {
+  let val = bot.cash;
+  for (const t of Object.keys(bot.holdings)) {
+    const p = priceOf(t) ?? bot.holdings[t].avgBuyPrice;
+    val += bot.holdings[t].shares * p;
+  }
+  return parseFloat(val.toFixed(2));
+}
+
+// The autonomous trading engine. Runs every tick for every user whose bot is
+// enabled. This is what makes buy/sell "real": it executes and persists trades
+// server-side, independent of any open browser tab, 24/7.
+function runTradingEngine() {
+  const now = new Date();
+  let anyChange = false;
+
+  for (const username of Object.keys(db.bots)) {
+    const bot = db.bots[username];
+    if (!bot || !bot.enabled) continue;
+
+    // Lazily capture benchmark start prices the first time the bot runs
+    if (!bot.benchmarkBasis) {
+      const basis: { [t: string]: number } = {};
+      for (const cfg of Object.values(bot.tickers)) {
+        if (cfg.enabled) {
+          const p = priceOf(cfg.ticker);
+          if (p) basis[cfg.ticker] = p;
+        }
+      }
+      if (Object.keys(basis).length > 0) {
+        bot.benchmarkBasis = basis;
+        anyChange = true;
+      }
+    }
+
+    for (const cfg of Object.values(bot.tickers)) {
+      if (!cfg.enabled) continue;
+      const price = priceOf(cfg.ticker);
+      if (price === null) continue;
+
+      const held = bot.holdings[cfg.ticker];
+
+      // ---- SELL side: take-profit OR stop-loss (risk management) ----
+      if (held && held.shares > 0) {
+        const tpHit = cfg.sellLimit > 0 && price >= cfg.sellLimit;
+        const tpPctHit =
+          bot.takeProfitPct > 0 &&
+          price >= held.avgBuyPrice * (1 + bot.takeProfitPct / 100);
+        const slHit =
+          bot.stopLossPct > 0 &&
+          price <= held.avgBuyPrice * (1 - bot.stopLossPct / 100);
+
+        if (tpHit || tpPctHit || slHit) {
+          const revenueBeforeFee = held.shares * price;
+          const revenueWithFee = revenueBeforeFee - bot.brokerCommission;
+          const costBasis = held.shares * held.avgBuyPrice;
+          // realized P&L = proceeds - cost - (buy fee already paid + this sell fee)
+          const profit = revenueBeforeFee - costBasis - bot.brokerCommission * 2;
+
+          bot.cash = parseFloat((bot.cash + revenueWithFee).toFixed(2));
+          const soldShares = held.shares;
+          delete bot.holdings[cfg.ticker];
+
+          bot.trades.unshift({
+            id: `S${crypto.randomBytes(3).toString("hex").toUpperCase()}`,
+            timestamp: now.toISOString(),
+            ticker: cfg.ticker,
+            type: "SELL",
+            shares: soldShares,
+            price,
+            total: parseFloat(revenueWithFee.toFixed(2)),
+            fee: bot.brokerCommission,
+            profit: parseFloat(profit.toFixed(2)),
+            reason: slHit
+              ? `Stop-loss (-${bot.stopLossPct}%)`
+              : tpHit
+              ? `Take-profit @ $${cfg.sellLimit}`
+              : `Take-profit (+${bot.takeProfitPct}%)`
+          });
+          anyChange = true;
+          continue; // don't also buy the same ticker this tick
+        }
+      }
+
+      // ---- BUY side: price at/below buy limit, with risk-sized position ----
+      if (cfg.buyLimit > 0 && price <= cfg.buyLimit) {
+        const existing = bot.holdings[cfg.ticker] || { shares: 0, avgBuyPrice: 0 };
+        const equity = botEquity(bot);
+        // Position sizing: deploy a % of total equity per buy
+        const budget = (bot.positionSizePct / 100) * equity;
+        let sharesToBuy = Math.floor(budget / price);
+        if (sharesToBuy < 1) sharesToBuy = 0;
+
+        const lotsHeld = existing.shares; // simple cap by share count proxy
+        const maxShares = bot.maxLotsPerTicker * Math.max(1, Math.floor(budget / price));
+        if (sharesToBuy > 0 && lotsHeld < maxShares) {
+          const costBeforeFee = sharesToBuy * price;
+          const costWithFee = costBeforeFee + bot.brokerCommission;
+          if (bot.cash >= costWithFee) {
+            bot.cash = parseFloat((bot.cash - costWithFee).toFixed(2));
+            const nextShares = existing.shares + sharesToBuy;
+            const nextAvg =
+              (existing.shares * existing.avgBuyPrice + costBeforeFee) / nextShares;
+            bot.holdings[cfg.ticker] = {
+              shares: nextShares,
+              avgBuyPrice: parseFloat(nextAvg.toFixed(2))
+            };
+            bot.trades.unshift({
+              id: `B${crypto.randomBytes(3).toString("hex").toUpperCase()}`,
+              timestamp: now.toISOString(),
+              ticker: cfg.ticker,
+              type: "BUY",
+              shares: sharesToBuy,
+              price,
+              total: parseFloat(costWithFee.toFixed(2)),
+              fee: bot.brokerCommission,
+              reason: `Buy limit <= $${cfg.buyLimit}`
+            });
+            anyChange = true;
+          }
+        }
+      }
+    }
+
+    // Trim trade history to keep file size sane over a 60-day run
+    if (bot.trades.length > 2000) bot.trades.length = 2000;
+
+    // Snapshot equity at most once per minute per user (keeps the curve compact)
+    const eq = botEquity(bot);
+    const last = bot.equityCurve[bot.equityCurve.length - 1];
+    if (!last || now.getTime() - new Date(last.t).getTime() >= 60000) {
+      bot.equityCurve.push({ t: now.toISOString(), equity: eq });
+      if (bot.equityCurve.length > 20000) bot.equityCurve.shift();
+      anyChange = true;
+    }
+  }
+
+  return anyChange;
+}
+
+// Start simulated stock fluctuations or fetch real Yahoo Finance live values,
+// then evaluate alerts and run the autonomous trading engine.
 setInterval(async () => {
   tickCount++;
   lastTickTime = new Date().toISOString();
-  const db = loadDB();
 
   if (useLiveFeed) {
-    // Phase 2: Live US market values connected to FREE server!
+    // Live US market values connected to the free Yahoo Finance endpoint
     await updateStocksFromYahoo();
   } else {
-    // Sandbox simulation: Random fluctuation between -0.4% and +0.4%
+    // Sandbox simulation: random fluctuation
     stocks.forEach(stock => {
       const change = (Math.random() - 0.5) * 0.008 * stock.currentPrice;
       stock.currentPrice = parseFloat((stock.currentPrice + change).toFixed(2));
-      
+
       if (stock.currentPrice > stock.high24h) stock.high24h = stock.currentPrice;
       if (stock.currentPrice < stock.low24h) stock.low24h = stock.currentPrice;
 
@@ -382,57 +673,49 @@ setInterval(async () => {
     });
   }
 
-  // Now evaluate configured alerts for all users
-  const activeAlertsEvaluatedList: { username: string; ticker: string; type: "BUY" | "SELL"; currentPrice: number; limit: number }[] = [];
-  
+  let changed = false;
+
+  // Evaluate configured alerts for all users (notification log only)
   stocks.forEach(stock => {
     Object.keys(db.alerts).forEach(username => {
-      const userAlerts = db.alerts[username];
-      const alert = userAlerts[stock.ticker];
-      if (alert) {
-        // Evaluate BUY threshold: price drops below threshold
-        if (alert.buyThreshold !== null && stock.currentPrice <= alert.buyThreshold) {
-          const userLogs = db.logs[username] || [];
-          const recentAlert = userLogs.find(l => l.ticker === stock.ticker && l.type === "BUY" && (Date.now() - new Date(l.timestamp).getTime() < 30050));
-          if (!recentAlert) {
-            const newLog = {
-              id: Math.random().toString(36).substring(2, 9),
-              ticker: stock.ticker,
-              type: "BUY" as const,
-              price: stock.currentPrice,
-              threshold: alert.buyThreshold,
-              timestamp: new Date().toISOString(),
-              read: false
-            };
-            db.logs[username] = db.logs[username] || [];
-            db.logs[username].unshift(newLog);
-            saveDB(db);
-          }
-        }
+      const alert = db.alerts[username]?.[stock.ticker];
+      if (!alert) return;
 
-        // Evaluate SELL threshold: price rises above threshold
-        if (alert.sellThreshold !== null && stock.currentPrice >= alert.sellThreshold) {
-          const userLogs = db.logs[username] || [];
-          const recentAlert = userLogs.find(l => l.ticker === stock.ticker && l.type === "SELL" && (Date.now() - new Date(l.timestamp).getTime() < 30050));
-          if (!recentAlert) {
-            const newLog = {
-              id: Math.random().toString(36).substring(2, 9),
-              ticker: stock.ticker,
-              type: "SELL" as const,
-              price: stock.currentPrice,
-              threshold: alert.sellThreshold,
-              timestamp: new Date().toISOString(),
-              read: false
-            };
-            db.logs[username] = db.logs[username] || [];
-            db.logs[username].unshift(newLog);
-            saveDB(db);
-          }
+      const pushLog = (type: "BUY" | "SELL", threshold: number) => {
+        const userLogs = db.logs[username] || [];
+        const recent = userLogs.find(
+          l => l.ticker === stock.ticker && l.type === type &&
+          Date.now() - new Date(l.timestamp).getTime() < 30050
+        );
+        if (!recent) {
+          db.logs[username] = db.logs[username] || [];
+          db.logs[username].unshift({
+            id: crypto.randomBytes(4).toString("hex"),
+            ticker: stock.ticker,
+            type,
+            price: stock.currentPrice,
+            threshold,
+            timestamp: new Date().toISOString(),
+            read: false
+          });
+          if (db.logs[username].length > 500) db.logs[username].length = 500;
+          changed = true;
         }
+      };
+
+      if (alert.buyThreshold !== null && stock.currentPrice <= alert.buyThreshold) {
+        pushLog("BUY", alert.buyThreshold);
+      }
+      if (alert.sellThreshold !== null && stock.currentPrice >= alert.sellThreshold) {
+        pushLog("SELL", alert.sellThreshold);
       }
     });
   });
 
+  // Run the autonomous trading engine
+  if (runTradingEngine()) changed = true;
+
+  if (changed) persist();
 }, 4000);
 
 // Live Feed Toggle endpoints
@@ -466,94 +749,237 @@ app.get("/api/server-info", (req, res) => {
 
 // API Endpoints
 
+// ---------------------------------------------------------------------------
+// Auth helpers: real token issuance + verification middleware.
+// Tokens are signed JWTs. The middleware VERIFIES the signature and resolves
+// the user from the verified payload - it never trusts client-supplied text.
+// This closes the previous "any string ending in a username = access" bypass.
+// ---------------------------------------------------------------------------
+function issueToken(username: string): string {
+  return jwt.sign({ sub: username }, JWT_SECRET, { expiresIn: TOKEN_TTL });
+}
+
+interface AuthedRequest extends express.Request {
+  username?: string;
+}
+
+function authMiddleware(req: AuthedRequest, res: express.Response, next: express.NextFunction) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as { sub?: string };
+    const username = String(payload.sub || "").toLowerCase().trim();
+    if (!username || !db.users[username]) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    req.username = username;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+function biometricRegistered(username: string): boolean {
+  return (db.users[username]?.credentials?.length || 0) > 0;
+}
+
+function seedNewUser(username: string) {
+  db.alerts[username] = {
+    "AAPL": { ticker: "AAPL", buyThreshold: 178.00, sellThreshold: 185.00, createdAt: new Date().toISOString() },
+    "TSLA": { ticker: "TSLA", buyThreshold: 170.00, sellThreshold: 182.00, createdAt: new Date().toISOString() }
+  };
+  db.portfolios[username] = {
+    "AAPL": { ticker: "AAPL", shares: 10, avgBuyPrice: 175.50 }
+  };
+  db.logs[username] = [];
+  // Seed a default bot pre-configured (disabled until the user starts it)
+  const bot = makeDefaultBot(5000);
+  for (const t of ["AAPL", "NVDA", "TSLA"]) {
+    const p = priceOf(t);
+    if (p) {
+      bot.tickers[t] = {
+        ticker: t,
+        enabled: true,
+        buyLimit: parseFloat((p * 0.97).toFixed(2)),
+        sellLimit: parseFloat((p * 1.06).toFixed(2))
+      };
+    }
+  }
+  db.bots[username] = bot;
+}
+
+// Rate limiting on authentication endpoints (brute-force protection)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "יותר מדי ניסיונות. נסה שוב בעוד מספר דקות." }
+});
+
 // Authentication API
-app.post("/api/auth/register", (req, res) => {
+app.post("/api/auth/register", authLimiter, async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: "Username and password are required" });
   }
+  const lowerUsername = String(username).toLowerCase().trim();
 
-  const db = loadDB();
-  const lowerUsername = username.toLowerCase().trim();
-
+  // Input validation
+  if (!/^[a-z0-9_.-]{3,32}$/.test(lowerUsername)) {
+    return res.status(400).json({ error: "שם המשתמש חייב להיות 3-32 תווים (אותיות אנגלית, ספרות, _ . -)" });
+  }
+  if (String(password).length < 4 || String(password).length > 128) {
+    return res.status(400).json({ error: "הסיסמה חייבת להיות באורך 4-128 תווים" });
+  }
   if (db.users[lowerUsername]) {
     return res.status(400).json({ error: "Username already exists" });
   }
 
-  // Purely string-manipulated storage as hashed-equivalent representation
-  const passwordHash = `hash_${password}_sec`;
+  // Real one-way hash (bcrypt with salt)
+  const passwordHash = await bcrypt.hash(String(password), 12);
   db.users[lowerUsername] = {
     passwordHash,
-    biometricRegistered: false
+    createdAt: new Date().toISOString(),
+    credentials: []
   };
-
-  // Seed default alert configurations for new users
-  db.alerts[lowerUsername] = {
-    "AAPL": { ticker: "AAPL", buyThreshold: 178.00, sellThreshold: 185.00, createdAt: new Date().toISOString() },
-    "TSLA": { ticker: "TSLA", buyThreshold: 170.00, sellThreshold: 182.00, createdAt: new Date().toISOString() }
-  };
-
-  // Seed default portfolio
-  db.portfolios[lowerUsername] = {
-    "AAPL": { ticker: "AAPL", shares: 10, avgBuyPrice: 175.50 }
-  };
-
-  db.logs[lowerUsername] = [];
-
-  saveDB(db);
+  seedNewUser(lowerUsername);
+  persist();
   res.json({ success: true });
 });
 
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   const { username, password } = req.body;
-  const db = loadDB();
   const lowerUsername = String(username || "").toLowerCase().trim();
-
   const user = db.users[lowerUsername];
-  if (!user || user.passwordHash !== `hash_${password}_sec`) {
+
+  // Always run a compare (even on missing user) to avoid timing/user enumeration
+  const hash = user?.passwordHash || "$2a$12$invalidinvalidinvalidinvalidinvalidinvalidinva";
+  const ok = await bcrypt.compare(String(password || ""), hash);
+  if (!user || !ok) {
     return res.status(401).json({ error: "שם משתמש או סיסמא שגויים" });
   }
 
-  const token = `token_${Math.random().toString(36).substring(2)}_${lowerUsername}`;
-  user.accessToken = token;
-  saveDB(db);
-
-  res.json({ username: lowerUsername, token, biometricRegistered: !!user.biometricRegistered });
+  const token = issueToken(lowerUsername);
+  res.json({ username: lowerUsername, token, biometricRegistered: biometricRegistered(lowerUsername) });
 });
 
-// Biometric setup
-app.post("/api/auth/biometric/register", (req, res) => {
-  const { username, credentialId } = req.body;
-  const db = loadDB();
-  const lowerUsername = String(username || "").toLowerCase().trim();
+// ---------------------------------------------------------------------------
+// Real WebAuthn (passkey / biometric) — challenge/response with public-key
+// cryptography. Registration requires an authenticated session; login verifies
+// a signature against the stored public key (cannot be forged by username alone).
+// ---------------------------------------------------------------------------
 
-  const user = db.users[lowerUsername];
-  if (!user) {
-    return res.status(404).json({ error: "User not found" });
-  }
-
-  user.biometricRegistered = true;
-  user.biometricCredentialId = credentialId || `bio_cred_${Math.random().toString(36).substring(2)}`;
-  saveDB(db);
-
-  res.json({ success: true });
+// 1) Registration options (must be logged in first)
+app.post("/api/auth/webauthn/register/options", authMiddleware, async (req: AuthedRequest, res) => {
+  const username = req.username!;
+  const user = db.users[username];
+  const options = await generateRegistrationOptions({
+    rpName: RP_NAME,
+    rpID: RP_ID,
+    userID: new TextEncoder().encode(username),
+    userName: username,
+    attestationType: "none",
+    excludeCredentials: user.credentials.map(c => ({
+      id: c.id,
+      transports: c.transports as any
+    })),
+    authenticatorSelection: {
+      residentKey: "preferred",
+      userVerification: "preferred"
+    }
+  });
+  user.currentChallenge = options.challenge;
+  persist();
+  res.json(options);
 });
 
-app.post("/api/auth/biometric/login", (req, res) => {
-  const { username } = req.body;
-  const db = loadDB();
-  const lowerUsername = String(username || "").toLowerCase().trim();
-
-  const user = db.users[lowerUsername];
-  if (!user || !user.biometricRegistered) {
-    return res.status(400).json({ error: "Biometric not registered or user does not exist" });
+// 2) Registration verification — stores the new credential
+app.post("/api/auth/webauthn/register/verify", authMiddleware, async (req: AuthedRequest, res) => {
+  const username = req.username!;
+  const user = db.users[username];
+  try {
+    const verification = await verifyRegistrationResponse({
+      response: req.body,
+      expectedChallenge: user.currentChallenge || "",
+      expectedOrigin: ORIGIN,
+      expectedRPID: RP_ID
+    });
+    if (!verification.verified || !verification.registrationInfo) {
+      return res.status(400).json({ error: "אימות הרישום הביומטרי נכשל" });
+    }
+    const cred = verification.registrationInfo.credential;
+    user.credentials.push({
+      id: cred.id,
+      publicKey: Buffer.from(cred.publicKey).toString("base64url"),
+      counter: cred.counter,
+      transports: cred.transports,
+      createdAt: new Date().toISOString()
+    });
+    user.currentChallenge = undefined;
+    persist();
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || "שגיאה ברישום הביומטרי" });
   }
+});
 
-  const token = `token_bio_${Math.random().toString(36).substring(2)}_${lowerUsername}`;
-  user.accessToken = token;
-  saveDB(db);
+// 3) Login options — produce a challenge for the user's registered credentials
+app.post("/api/auth/webauthn/login/options", authLimiter, async (req, res) => {
+  const username = String(req.body?.username || "").toLowerCase().trim();
+  const user = db.users[username];
+  if (!user || user.credentials.length === 0) {
+    return res.status(400).json({ error: "לא נמצא מפתח ביומטרי רשום למשתמש זה" });
+  }
+  const options = await generateAuthenticationOptions({
+    rpID: RP_ID,
+    allowCredentials: user.credentials.map(c => ({
+      id: c.id,
+      transports: c.transports as any
+    })),
+    userVerification: "preferred"
+  });
+  user.currentChallenge = options.challenge;
+  persist();
+  res.json(options);
+});
 
-  res.json({ username: lowerUsername, token, biometricRegistered: true });
+// 4) Login verification — verifies the signature, then issues a JWT
+app.post("/api/auth/webauthn/login/verify", authLimiter, async (req, res) => {
+  const username = String(req.body?.username || "").toLowerCase().trim();
+  const user = db.users[username];
+  if (!user || user.credentials.length === 0) {
+    return res.status(400).json({ error: "משתמש או מפתח ביומטרי לא נמצא" });
+  }
+  const cred = user.credentials.find(c => c.id === req.body?.response?.id || c.id === req.body?.id);
+  if (!cred) {
+    return res.status(400).json({ error: "המפתח הביומטרי אינו מוכר" });
+  }
+  try {
+    const verification = await verifyAuthenticationResponse({
+      response: req.body,
+      expectedChallenge: user.currentChallenge || "",
+      expectedOrigin: ORIGIN,
+      expectedRPID: RP_ID,
+      credential: {
+        id: cred.id,
+        publicKey: Buffer.from(cred.publicKey, "base64url"),
+        counter: cred.counter,
+        transports: cred.transports as any
+      }
+    });
+    if (!verification.verified) {
+      return res.status(401).json({ error: "האימות הביומטרי נכשל" });
+    }
+    cred.counter = verification.authenticationInfo.newCounter;
+    user.currentChallenge = undefined;
+    persist();
+    const token = issueToken(username);
+    res.json({ username, token, biometricRegistered: true });
+  } catch (err: any) {
+    res.status(401).json({ error: err?.message || "שגיאה באימות הביומטרי" });
+  }
 });
 
 // Get leading stocks
@@ -632,29 +1058,18 @@ app.get("/api/news", async (req, res) => {
 });
 
 // Alarm / Alert thresholds APIs (Configured per user)
-app.get("/api/alerts/config", (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-
-  const token = authHeader.replace("Bearer ", "");
-  const username = token.split("_").pop() || "";
-  
-  const db = loadDB();
+app.get("/api/alerts/config", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
   const userAlerts = db.alerts[username] || {};
   res.json({ configs: Object.values(userAlerts) });
 });
 
-app.post("/api/alerts/config", (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-
-  const token = authHeader.replace("Bearer ", "");
-  const username = token.split("_").pop() || "";
+app.post("/api/alerts/config", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
 
   const { ticker, buyThreshold, sellThreshold } = req.body;
   if (!ticker) return res.status(400).json({ error: "Missing ticker" });
 
-  const db = loadDB();
   db.alerts[username] = db.alerts[username] || {};
 
   db.alerts[username][ticker] = {
@@ -664,66 +1079,43 @@ app.post("/api/alerts/config", (req, res) => {
     createdAt: new Date().toISOString()
   };
 
-  saveDB(db);
+  persist();
   res.json({ success: true, alert: db.alerts[username][ticker] });
 });
 
 // Get alert trigger log list
-app.get("/api/alerts/logs", (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-
-  const token = authHeader.replace("Bearer ", "");
-  const username = token.split("_").pop() || "";
-
-  const db = loadDB();
+app.get("/api/alerts/logs", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
   const userLogs = db.logs[username] || [];
   res.json({ logs: userLogs });
 });
 
-app.post("/api/alerts/logs/read", (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-
-  const token = authHeader.replace("Bearer ", "");
-  const username = token.split("_").pop() || "";
-
-  const db = loadDB();
+app.post("/api/alerts/logs/read", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
   const logs = db.logs[username] || [];
   logs.forEach(log => {
     log.read = true;
   });
   db.logs[username] = logs;
-  saveDB(db);
+  persist();
   res.json({ success: true });
 });
 
 // Portfolio Tracker APIs
-app.get("/api/portfolio", (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-
-  const token = authHeader.replace("Bearer ", "");
-  const username = token.split("_").pop() || "";
-
-  const db = loadDB();
+app.get("/api/portfolio", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
   const userPortfolio = db.portfolios[username] || {};
   res.json({ portfolio: Object.values(userPortfolio) });
 });
 
-app.post("/api/portfolio/trade", (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-
-  const token = authHeader.replace("Bearer ", "");
-  const username = token.split("_").pop() || "";
+app.post("/api/portfolio/trade", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
 
   const { ticker, shares, type, price } = req.body;
   if (!ticker || !shares || !type || !price) {
     return res.status(400).json({ error: "Missing trade data" });
   }
 
-  const db = loadDB();
   db.portfolios[username] = db.portfolios[username] || {};
   const currentShares = db.portfolios[username][ticker]?.shares || 0;
   const currentAvgPrice = db.portfolios[username][ticker]?.avgBuyPrice || 0;
@@ -755,8 +1147,167 @@ app.post("/api/portfolio/trade", (req, res) => {
     }
   }
 
-  saveDB(db);
+  persist();
   res.json({ success: true, portfolio: db.portfolios[username] });
+});
+
+// ---------------------------------------------------------------------------
+// Autonomous trading bot — configuration, control, state & performance metrics
+// ---------------------------------------------------------------------------
+
+// Get current bot config + live state
+app.get("/api/bot", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
+  db.bots[username] = db.bots[username] || makeDefaultBot();
+  const bot = db.bots[username];
+  res.json({
+    config: {
+      enabled: bot.enabled,
+      startingCapital: bot.startingCapital,
+      brokerCommission: bot.brokerCommission,
+      positionSizePct: bot.positionSizePct,
+      stopLossPct: bot.stopLossPct,
+      takeProfitPct: bot.takeProfitPct,
+      maxLotsPerTicker: bot.maxLotsPerTicker,
+      startedAt: bot.startedAt,
+      tickers: Object.values(bot.tickers)
+    },
+    cash: bot.cash,
+    holdings: Object.entries(bot.holdings).map(([ticker, h]) => ({ ticker, ...h })),
+    equity: botEquity(bot),
+    trades: bot.trades.slice(0, 200),
+    equityCurve: bot.equityCurve.slice(-500)
+  });
+});
+
+// Update bot configuration (does not start it)
+app.post("/api/bot/config", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
+  db.bots[username] = db.bots[username] || makeDefaultBot();
+  const bot = db.bots[username];
+  const b = req.body || {};
+
+  if (typeof b.startingCapital === "number" && b.startingCapital > 0) {
+    bot.startingCapital = b.startingCapital;
+  }
+  if (typeof b.brokerCommission === "number" && b.brokerCommission >= 0) bot.brokerCommission = b.brokerCommission;
+  if (typeof b.positionSizePct === "number") bot.positionSizePct = Math.min(100, Math.max(1, b.positionSizePct));
+  if (typeof b.stopLossPct === "number") bot.stopLossPct = Math.min(90, Math.max(0, b.stopLossPct));
+  if (typeof b.takeProfitPct === "number") bot.takeProfitPct = Math.min(500, Math.max(0, b.takeProfitPct));
+  if (typeof b.maxLotsPerTicker === "number") bot.maxLotsPerTicker = Math.min(20, Math.max(1, Math.floor(b.maxLotsPerTicker)));
+
+  if (Array.isArray(b.tickers)) {
+    for (const t of b.tickers) {
+      if (!t || !t.ticker) continue;
+      const tk = String(t.ticker).toUpperCase();
+      if (!stocks.find(s => s.ticker === tk)) continue;
+      bot.tickers[tk] = {
+        ticker: tk,
+        enabled: !!t.enabled,
+        buyLimit: typeof t.buyLimit === "number" ? parseFloat(t.buyLimit.toFixed(2)) : 0,
+        sellLimit: typeof t.sellLimit === "number" ? parseFloat(t.sellLimit.toFixed(2)) : 0
+      };
+    }
+  }
+  persist();
+  res.json({ success: true });
+});
+
+// Start the bot (resets capital/positions and begins from now)
+app.post("/api/bot/start", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
+  db.bots[username] = db.bots[username] || makeDefaultBot();
+  const bot = db.bots[username];
+  bot.enabled = true;
+  bot.startedAt = new Date().toISOString();
+  bot.cash = bot.startingCapital;
+  bot.holdings = {};
+  bot.trades = [];
+  bot.equityCurve = [{ t: bot.startedAt, equity: bot.startingCapital }];
+  bot.benchmarkBasis = null; // recaptured on first engine run
+  persist();
+  res.json({ success: true, startedAt: bot.startedAt });
+});
+
+// Stop the bot (keeps history)
+app.post("/api/bot/stop", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
+  if (db.bots[username]) {
+    db.bots[username].enabled = false;
+    persist();
+  }
+  res.json({ success: true });
+});
+
+// Performance metrics: return vs benchmark, win-rate, drawdown, Sharpe, etc.
+app.get("/api/bot/metrics", authMiddleware, (req, res) => {
+  const username = (req as AuthedRequest).username!;
+  const bot = db.bots[username];
+  if (!bot) return res.json({ metrics: null });
+
+  const equity = botEquity(bot);
+  const totalReturnPct = ((equity - bot.startingCapital) / bot.startingCapital) * 100;
+
+  // Realized trade stats
+  const sells = bot.trades.filter(t => t.type === "SELL" && typeof t.profit === "number");
+  const wins = sells.filter(t => (t.profit || 0) > 0).length;
+  const realizedPnL = sells.reduce((acc, t) => acc + (t.profit || 0), 0);
+  const winRate = sells.length > 0 ? (wins / sells.length) * 100 : 0;
+
+  // Max drawdown from equity curve
+  let peak = bot.startingCapital;
+  let maxDD = 0;
+  for (const pt of bot.equityCurve) {
+    if (pt.equity > peak) peak = pt.equity;
+    const dd = (peak - pt.equity) / peak;
+    if (dd > maxDD) maxDD = dd;
+  }
+
+  // Sharpe-like ratio from period-over-period equity returns (not annualized)
+  const rets: number[] = [];
+  for (let i = 1; i < bot.equityCurve.length; i++) {
+    const prev = bot.equityCurve[i - 1].equity;
+    if (prev > 0) rets.push((bot.equityCurve[i].equity - prev) / prev);
+  }
+  let sharpe = 0;
+  if (rets.length > 1) {
+    const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+    const variance = rets.reduce((a, b) => a + (b - mean) ** 2, 0) / rets.length;
+    const std = Math.sqrt(variance);
+    sharpe = std > 0 ? (mean / std) * Math.sqrt(rets.length) : 0;
+  }
+
+  // Buy & hold benchmark: equal-weight the enabled tickers at bot start
+  let benchmarkReturnPct: number | null = null;
+  if (bot.benchmarkBasis && Object.keys(bot.benchmarkBasis).length > 0) {
+    const tickers = Object.keys(bot.benchmarkBasis);
+    const perTicker = bot.startingCapital / tickers.length;
+    let bmValue = 0;
+    for (const t of tickers) {
+      const start = bot.benchmarkBasis[t];
+      const now = priceOf(t) ?? start;
+      bmValue += perTicker * (now / start);
+    }
+    benchmarkReturnPct = ((bmValue - bot.startingCapital) / bot.startingCapital) * 100;
+  }
+
+  res.json({
+    metrics: {
+      startingCapital: bot.startingCapital,
+      equity,
+      cash: bot.cash,
+      totalReturnPct: parseFloat(totalReturnPct.toFixed(2)),
+      realizedPnL: parseFloat(realizedPnL.toFixed(2)),
+      totalTrades: bot.trades.length,
+      closedTrades: sells.length,
+      winRate: parseFloat(winRate.toFixed(1)),
+      maxDrawdownPct: parseFloat((maxDD * 100).toFixed(2)),
+      sharpe: parseFloat(sharpe.toFixed(2)),
+      benchmarkReturnPct: benchmarkReturnPct !== null ? parseFloat(benchmarkReturnPct.toFixed(2)) : null,
+      startedAt: bot.startedAt,
+      enabled: bot.enabled
+    }
+  });
 });
 
 // Gemini AI Stock Analysis & Wise Recommendations

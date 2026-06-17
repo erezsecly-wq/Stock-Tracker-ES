@@ -1,0 +1,8 @@
+node_modules
+dist
+.git
+*.log
+data_store.json
+data_store.json.tmp
+.env
+.env.local

@@ -226,7 +226,7 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 lg:items-start">
         {/* Strategy config */}
         <div className={`${card} lg:col-span-1 space-y-4`}>
           <h4 className={`text-sm font-bold ${themeVal >= 70 ? "text-slate-900" : "text-slate-100"}`}>הגדרות אסטרטגיה וסיכון</h4>
@@ -286,7 +286,7 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
               <button onClick={smartThresholds} className="text-[11px] font-bold py-1.5 px-2.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950">⚡ ספים חכמים</button>
             </div>
           </div>
-          <div className="space-y-2 max-h-[360px] overflow-y-auto pr-1">
+          <div className="space-y-2 max-h-[600px] overflow-y-auto pr-1">
             {tickers.map(t => (
               <div key={t.ticker} className={`p-3 rounded-2xl border ${theme.border} ${theme.subCard} flex flex-wrap items-center gap-3`}>
                 <label className="flex items-center gap-2 cursor-pointer min-w-[90px]">
@@ -363,8 +363,8 @@ function Metric({ theme, themeVal, label, value, positive, icon }: { theme: any;
     : positive ? "text-emerald-400" : "text-rose-400";
   return (
     <div className={`p-3 rounded-2xl border ${theme.border} ${theme.subCard} text-center`}>
-      <div className={`text-[10px] ${theme.textMuted} mb-1 flex items-center justify-center gap-1`}>{icon}{label}</div>
-      <div className={`text-sm font-black font-mono ${color}`}>{value}</div>
+      <div className={`text-xs ${theme.textMuted} mb-1 flex items-center justify-center gap-1`}>{icon}{label}</div>
+      <div className={`text-lg font-black font-mono ${color}`}>{value}</div>
     </div>
   );
 }

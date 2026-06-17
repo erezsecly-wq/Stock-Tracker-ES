@@ -539,8 +539,8 @@ export default function App() {
       <style>{`
         /* Uniform proportional text scaling: every size scales by the SAME factor
            (fontSize/16) so the whole UI grows together — including tiny px labels. */
-        #dashboard_core .text-xs { font-size: ${(12 * fontSize / 16).toFixed(1)}px !important; }
-        #dashboard_core .text-sm { font-size: ${(14 * fontSize / 16).toFixed(1)}px !important; }
+        #dashboard_core .text-xs { font-size: ${(13.5 * fontSize / 16).toFixed(1)}px !important; }
+        #dashboard_core .text-sm { font-size: ${(15.5 * fontSize / 16).toFixed(1)}px !important; }
         #dashboard_core .text-md { font-size: ${(16 * fontSize / 16).toFixed(1)}px !important; }
         #dashboard_core .text-base { font-size: ${(16 * fontSize / 16).toFixed(1)}px !important; }
         #dashboard_core .text-lg { font-size: ${(18 * fontSize / 16).toFixed(1)}px !important; }
@@ -558,7 +558,7 @@ export default function App() {
         #dashboard_core .text-\\[12px\\],
         #dashboard_core .text-\\[12.5px\\],
         #dashboard_core .text-\\[13px\\] {
-          font-size: ${(12.5 * fontSize / 16).toFixed(1)}px !important;
+          font-size: ${(14.5 * fontSize / 16).toFixed(1)}px !important;
         }
         ${themeVal < 50 ? `
           #dashboard_core .text-slate-200,

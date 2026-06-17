@@ -537,46 +537,29 @@ export default function App() {
     >
       {/* Dynamic Inject Style Tag to scale any explicit/arbitrary fine-grain font-size classes seamlessly! */}
       <style>{`
-        #dashboard_core {
-          font-size: ${fontSize}px !important;
+        /* Uniform proportional text scaling: every size scales by the SAME factor
+           (fontSize/16) so the whole UI grows together — including tiny px labels. */
+        #dashboard_core .text-xs { font-size: ${(12 * fontSize / 16).toFixed(1)}px !important; }
+        #dashboard_core .text-sm { font-size: ${(14 * fontSize / 16).toFixed(1)}px !important; }
+        #dashboard_core .text-md { font-size: ${(16 * fontSize / 16).toFixed(1)}px !important; }
+        #dashboard_core .text-base { font-size: ${(16 * fontSize / 16).toFixed(1)}px !important; }
+        #dashboard_core .text-lg { font-size: ${(18 * fontSize / 16).toFixed(1)}px !important; }
+        #dashboard_core .text-xl { font-size: ${(20 * fontSize / 16).toFixed(1)}px !important; }
+        #dashboard_core .text-2xl { font-size: ${(24 * fontSize / 16).toFixed(1)}px !important; }
+        #dashboard_core .text-3xl { font-size: ${(30 * fontSize / 16).toFixed(1)}px !important; }
+        #dashboard_core .text-\\[8px\\],
+        #dashboard_core .text-\\[8.5px\\],
+        #dashboard_core .text-\\[9px\\],
+        #dashboard_core .text-\\[9.5px\\],
+        #dashboard_core .text-\\[10px\\],
+        #dashboard_core .text-\\[10.5px\\],
+        #dashboard_core .text-\\[11px\\],
+        #dashboard_core .text-\\[11.5px\\],
+        #dashboard_core .text-\\[12px\\],
+        #dashboard_core .text-\\[12.5px\\],
+        #dashboard_core .text-\\[13px\\] {
+          font-size: ${(12.5 * fontSize / 16).toFixed(1)}px !important;
         }
-        #dashboard_core .text-xs, 
-        #dashboard_core .text-\\[10px\\], 
-        #dashboard_core .text-\\[10.5px\\], 
-        #dashboard_core .text-\\[9.5px\\], 
-        #dashboard_core .text-\\[9px\\], 
-        #dashboard_core .text-\\[8.5px\\], 
-        #dashboard_core .text-\\[11px\\], 
-        #dashboard_core .text-\\[11.5px\\], 
-        #dashboard_core .text-\\[12px\\], 
-        #dashboard_core .text-\\[12.5px\\], 
-        #dashboard_core .text-\\[13px\\], 
-        #dashboard_core .text-\\[8px\\] {
-          font-size: ${Math.max(15, fontSize - 2)}px !important;
-          color: var(--gradual-text-primary) !important;
-        }
-        #dashboard_core .text-sm {
-          font-size: ${fontSize + 1}px !important;
-        }
-        #dashboard_core .text-md {
-          font-size: ${fontSize + 3}px !important;
-        }
-        #dashboard_core .text-base {
-          font-size: ${fontSize + 3}px !important;
-        }
-        #dashboard_core .text-lg {
-          font-size: ${fontSize + 5}px !important;
-        }
-        #dashboard_core .text-xl {
-          font-size: ${fontSize + 7}px !important;
-        }
-        #dashboard_core .text-2xl {
-          font-size: ${fontSize + 11}px !important;
-        }
-        #dashboard_core .text-3xl {
-          font-size: ${fontSize + 15}px !important;
-        }
-        /* Bright white override for dark mode text items to remove annoying slate transparency */
         ${themeVal < 50 ? `
           #dashboard_core .text-slate-200,
           #dashboard_core .text-slate-300,

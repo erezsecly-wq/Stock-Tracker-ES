@@ -546,8 +546,13 @@ export default function App() {
         #dashboard_core .text-\\[9.5px\\], 
         #dashboard_core .text-\\[9px\\], 
         #dashboard_core .text-\\[8.5px\\], 
+        #dashboard_core .text-\\[11px\\], 
+        #dashboard_core .text-\\[11.5px\\], 
+        #dashboard_core .text-\\[12px\\], 
+        #dashboard_core .text-\\[12.5px\\], 
+        #dashboard_core .text-\\[13px\\], 
         #dashboard_core .text-\\[8px\\] {
-          font-size: ${Math.max(12, fontSize - 2)}px !important;
+          font-size: ${Math.max(15, fontSize - 2)}px !important;
           color: var(--gradual-text-primary) !important;
         }
         #dashboard_core .text-sm {

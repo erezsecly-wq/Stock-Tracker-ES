@@ -1,0 +1,6 @@
+{
+  "name": "Wise Stock Tracker & Alerts",
+  "description": "An investment companion supporting secure biometrics, real-time stock alert thresholds, custom portfolios, 60-day simulated backtests, and Gemini AI stock analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

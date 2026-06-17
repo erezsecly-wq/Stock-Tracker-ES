@@ -1160,6 +1160,18 @@ app.get("/api/bot", authMiddleware, (req, res) => {
   const username = (req as AuthedRequest).username!;
   db.bots[username] = db.bots[username] || makeDefaultBot();
   const bot = db.bots[username];
+  // Ensure every market stock is available to toggle in the bot UI
+  for (const s of stocks) {
+    if (!bot.tickers[s.ticker]) {
+      bot.tickers[s.ticker] = {
+        ticker: s.ticker,
+        enabled: false,
+        buyLimit: parseFloat((s.currentPrice * 0.97).toFixed(2)),
+        sellLimit: parseFloat((s.currentPrice * 1.06).toFixed(2))
+      };
+    }
+  }
+  persist();
   res.json({
     config: {
       enabled: bot.enabled,

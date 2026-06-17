@@ -62,7 +62,7 @@ export default function App() {
   // Base typography font size scaling: 13 to 22px
   const [fontSize, setFontSize] = useState<number>(() => {
     const saved = localStorage.getItem("font_size");
-    return saved ? parseInt(saved) : 15; // Default to 15px (clear & legible)
+    return saved ? Math.max(16, parseInt(saved)) : 18; // Larger, comfortable default
   });
 
   // Sound enabled mute value
@@ -621,7 +621,7 @@ export default function App() {
 
       {/* Main header navbar */}
       <header className={`border-b ${theme.border} ${theme.navBg} backdrop-blur-md sticky top-0 z-40 select-none transition-all duration-300`}>
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+        <div className="w-full px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
           
           {/* Right brand logo */}
           <div className="flex items-center gap-3">
@@ -675,7 +675,7 @@ export default function App() {
                 <input
                   type="range"
                   min="13"
-                  max="22"
+                  max="26"
                   value={fontSize}
                   onChange={(e) => {
                     const val = parseInt(e.target.value);
@@ -759,7 +759,7 @@ export default function App() {
       </header>
 
       {/* Main dashboard content container */}
-      <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
+      <main className="flex-1 w-full px-4 sm:px-6 lg:px-8 py-8 w-full">
         
         {/* Navigation Selector Tabs */}
         <div className={`flex border-b ${theme.border} mb-8 select-none`}>

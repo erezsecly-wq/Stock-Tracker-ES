@@ -61,7 +61,7 @@ export default function App() {
 
   // Base typography font size scaling: 13 to 22px
   const [fontSize, setFontSize] = useState<number>(() => {
-    const saved = localStorage.getItem("font_size_v2");
+    const saved = localStorage.getItem("font_size_v3");
     return saved ? parseInt(saved) : 20; // Significantly larger, crisp default
   });
 
@@ -668,7 +668,7 @@ export default function App() {
                   style={{ direction: 'ltr' }}
                   title="גרור כדי לשנות בהדרגה את גוון ובהירות הרקע מהכהה הטהור ועד הבהיר הנעים"
                 />
-                <div className="flex justify-between text-[8px] font-black text-slate-400 mt-1 leading-none">
+                <div dir="ltr" className="flex justify-between text-[8px] font-black text-slate-400 mt-1 leading-none">
                   <span>כפתור שחור</span>
                   <span className="text-cyan-405 font-bold">{themeVal}%</span>
                   <span>כפתור לבן</span>
@@ -691,13 +691,13 @@ export default function App() {
                   onChange={(e) => {
                     const val = parseInt(e.target.value);
                     setFontSize(val);
-                    localStorage.setItem("font_size_v2", String(val));
+                    localStorage.setItem("font_size_v3", String(val));
                   }}
                   className="w-full h-1 bg-slate-400/30 rounded-lg appearance-none cursor-pointer accent-cyan-500 focus:outline-none"
                   style={{ direction: 'ltr' }}
                   title="גרור כדי להגדיל או להקטין את כל הכיתובים וגופני המסך לנוחות קריאה מלאה"
                 />
-                <div className="flex justify-between text-[8px] font-black text-slate-400 mt-1 leading-none">
+                <div dir="ltr" className="flex justify-between text-[8px] font-black text-slate-400 mt-1 leading-none">
                   <span>קטן</span>
                   <span className="text-cyan-405 font-bold">{fontSize}px</span>
                   <span>ענק</span>

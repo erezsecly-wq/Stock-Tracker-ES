@@ -77,6 +77,7 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
   const [tickers, setTickers] = useState<TickerCfg[]>([]);
   const [loadedOnce, setLoadedOnce] = useState(false);
   const [liveFeed, setLiveFeed] = useState(false);
+  const [now, setNow] = useState(Date.now());
 
   const auth = { Authorization: `Bearer ${token}` };
 
@@ -116,6 +117,25 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
     const id = setInterval(load, 4000);
     return () => clearInterval(id);
   }, [load]);
+
+  // Live ticking clock for the "time since start" display
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Format elapsed time since the bot test started
+  const elapsedSince = (startISO: string | null) => {
+    if (!startISO) return "";
+    const ms = now - new Date(startISO).getTime();
+    if (ms < 0) return "";
+    const days = Math.floor(ms / 86400000);
+    const hours = Math.floor((ms % 86400000) / 3600000);
+    const mins = Math.floor((ms % 3600000) / 60000);
+    return `${days} ימים, ${hours} שעות, ${mins} דקות`;
+  };
+  const daysElapsed = (startISO: string | null) =>
+    startISO ? Math.floor((now - new Date(startISO).getTime()) / 86400000) : 0;
 
   const flash = (m: string) => {
     setMsg(m);
@@ -208,9 +228,14 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
             </h3>
             <p className={`text-xs ${theme.textMuted}`}>
               {running
-                ? `פעיל מאז ${data?.config.startedAt ? new Date(data.config.startedAt).toLocaleString("he-IL") : ""}`
+                ? `פעיל מאז ${data?.config.startedAt ? new Date(data.config.startedAt).toLocaleDateString("he-IL") : ""} · עברו ${elapsedSince(data?.config.startedAt || null)}`
                 : "כבוי — הגדר אסטרטגיה ולחץ הפעלה"}
             </p>
+            {running && (
+              <span className="inline-block mt-1 text-[11px] font-bold px-2 py-0.5 rounded-lg bg-cyan-500/15 text-cyan-400 border border-cyan-500/30">
+                יום {daysElapsed(data?.config.startedAt || null) + 1} מתוך 60
+              </span>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-2">

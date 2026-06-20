@@ -139,6 +139,9 @@ interface DatabaseSchema {
   bots: {
     [username: string]: BotState;
   };
+  settings: {
+    useLiveFeed: boolean;
+  };
 }
 
 // Initial default database structure
@@ -147,7 +150,8 @@ const initialDB: DatabaseSchema = {
   alerts: {},
   portfolios: {},
   logs: {},
-  bots: {}
+  bots: {},
+  settings: { useLiveFeed: false }
 };
 
 // Seed stock data
@@ -390,7 +394,8 @@ function readDBFromDisk(): DatabaseSchema {
         alerts: parsed.alerts || {},
         portfolios: parsed.portfolios || {},
         logs: parsed.logs || {},
-        bots: parsed.bots || {}
+        bots: parsed.bots || {},
+        settings: parsed.settings || { useLiveFeed: false }
       };
     }
   } catch (err) {
@@ -458,8 +463,9 @@ function makeDefaultBot(startingCapital = 5000): BotState {
   };
 }
 
-// Global flag for connecting to real-market free provider (Yahoo Finance)
-let useLiveFeed = false;
+// Global flag for connecting to real-market free provider (Yahoo Finance).
+// Restored from disk so the choice survives restarts/redeploys.
+let useLiveFeed = db.settings.useLiveFeed;
 const serverStartTime = new Date();
 let tickCount = 0;
 let lastTickTime = new Date().toISOString();
@@ -772,6 +778,8 @@ app.get("/api/config/live-feed", (req, res) => {
 app.post("/api/config/live-feed", (req, res) => {
   const { enabled } = req.body;
   useLiveFeed = !!enabled;
+  db.settings.useLiveFeed = useLiveFeed;
+  persist();
   res.json({ success: true, useLiveFeed });
 });
 

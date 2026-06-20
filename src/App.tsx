@@ -756,8 +756,8 @@ export default function App() {
       <main className="flex-1 w-full px-4 sm:px-6 lg:px-8 py-8 w-full">
         
         {/* Navigation Selector Tabs */}
-        <div className={`flex border-b ${theme.border} mb-8 select-none`}>
-          <nav className="flex gap-6 -mb-px">
+        <div className={`flex border-b ${theme.border} mb-8 select-none overflow-x-auto`}>
+          <nav className="flex gap-4 sm:gap-6 -mb-px min-w-max">
             <button
               onClick={() => setActiveTab("market")}
               className={`pb-4 text-sm font-bold border-b-2 transition-all flex items-center gap-1.5

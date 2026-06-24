@@ -86,11 +86,14 @@ interface BotState {
   stopLossPct: number;         // sell if price falls this % below avg cost (0 = off)
   takeProfitPct: number;       // sell if price rises this % above avg cost (0 = use sellLimit only)
   maxLotsPerTicker: number;    // cap accumulation per ticker
+  trailingStopPct: number;     // sell if price falls this % from the peak while in profit (0=off)
+  tradeCooldownSec: number;    // min seconds between trades on the same ticker (anti-churn)
   startedAt: string | null;
   adaptive: boolean;            // auto-learn & adjust thresholds to the market
   lastAdaptAt: string | null;
+  lastTradeAt: { [ticker: string]: string };
   tickers: { [ticker: string]: BotTickerConfig };
-  holdings: { [ticker: string]: { shares: number; avgBuyPrice: number } };
+  holdings: { [ticker: string]: { shares: number; avgBuyPrice: number; peakPrice?: number } };
   trades: BotTrade[];
   equityCurve: { t: string; equity: number }[]; // periodic equity snapshots
   benchmarkBasis: { [ticker: string]: number } | null; // start prices for buy&hold benchmark
@@ -447,14 +450,17 @@ function makeDefaultBot(startingCapital = 5000): BotState {
     enabled: false,
     startingCapital,
     cash: startingCapital,
-    brokerCommission: 1.0,
+    brokerCommission: 0,
     positionSizePct: 15,
-    stopLossPct: 8,
+    stopLossPct: 6,
     takeProfitPct: 0,
     maxLotsPerTicker: 3,
+    trailingStopPct: 4,
+    tradeCooldownSec: 900,
     startedAt: null,
-    adaptive: false,
+    adaptive: true,
     lastAdaptAt: null,
+    lastTradeAt: {},
     tickers: {},
     holdings: {},
     trades: [],
@@ -592,26 +598,35 @@ function runTradingEngine() {
 
       const held = bot.holdings[cfg.ticker];
 
-      // ---- SELL side: take-profit OR stop-loss (risk management) ----
+      // Track the peak price reached while holding (for the trailing stop)
+      if (held && held.shares > 0) {
+        held.peakPrice = Math.max(held.peakPrice ?? held.avgBuyPrice, price);
+      }
+
+      // Per-ticker cooldown to avoid over-trading and fee bleed
+      const lastAt = bot.lastTradeAt[cfg.ticker];
+      const cooledDown = !lastAt || (now.getTime() - new Date(lastAt).getTime()) >= bot.tradeCooldownSec * 1000;
+
+      // ---- SELL side: take-profit / trailing-stop / stop-loss ----
       if (held && held.shares > 0) {
         const tpHit = cfg.sellLimit > 0 && price >= cfg.sellLimit;
-        const tpPctHit =
-          bot.takeProfitPct > 0 &&
-          price >= held.avgBuyPrice * (1 + bot.takeProfitPct / 100);
-        const slHit =
-          bot.stopLossPct > 0 &&
-          price <= held.avgBuyPrice * (1 - bot.stopLossPct / 100);
+        const tpPctHit = bot.takeProfitPct > 0 && price >= held.avgBuyPrice * (1 + bot.takeProfitPct / 100);
+        const slHit = bot.stopLossPct > 0 && price <= held.avgBuyPrice * (1 - bot.stopLossPct / 100);
+        // Trailing stop: once in profit, lock gains if price falls X% from the peak
+        const inProfit = price > held.avgBuyPrice;
+        const trailHit = bot.trailingStopPct > 0 && inProfit && !!held.peakPrice &&
+          price <= held.peakPrice * (1 - bot.trailingStopPct / 100);
 
-        if (tpHit || tpPctHit || slHit) {
+        if (tpHit || tpPctHit || slHit || trailHit) {
           const revenueBeforeFee = held.shares * price;
           const revenueWithFee = revenueBeforeFee - bot.brokerCommission;
           const costBasis = held.shares * held.avgBuyPrice;
-          // realized P&L = proceeds - cost - (buy fee already paid + this sell fee)
           const profit = revenueBeforeFee - costBasis - bot.brokerCommission * 2;
 
           bot.cash = parseFloat((bot.cash + revenueWithFee).toFixed(2));
           const soldShares = held.shares;
           delete bot.holdings[cfg.ticker];
+          bot.lastTradeAt[cfg.ticker] = now.toISOString();
 
           bot.trades.unshift({
             id: `S${crypto.randomBytes(3).toString("hex").toUpperCase()}`,
@@ -623,10 +638,9 @@ function runTradingEngine() {
             total: parseFloat(revenueWithFee.toFixed(2)),
             fee: bot.brokerCommission,
             profit: parseFloat(profit.toFixed(2)),
-            reason: slHit
-              ? `Stop-loss (-${bot.stopLossPct}%)`
-              : tpHit
-              ? `Take-profit @ $${cfg.sellLimit}`
+            reason: slHit ? `Stop-loss (-${bot.stopLossPct}%)`
+              : trailHit ? `Trailing-stop (-${bot.trailingStopPct}% from peak)`
+              : tpHit ? `Take-profit @ $${cfg.sellLimit}`
               : `Take-profit (+${bot.takeProfitPct}%)`
           });
           anyChange = true;
@@ -634,41 +648,49 @@ function runTradingEngine() {
         }
       }
 
-      // ---- BUY side: price at/below buy limit, with risk-sized position ----
-      if (cfg.buyLimit > 0 && price <= cfg.buyLimit) {
-        const existing = bot.holdings[cfg.ticker] || { shares: 0, avgBuyPrice: 0 };
-        const equity = botEquity(bot);
-        // Position sizing: deploy a % of total equity per buy
-        const budget = (bot.positionSizePct / 100) * equity;
-        let sharesToBuy = Math.floor(budget / price);
-        if (sharesToBuy < 1) sharesToBuy = 0;
-
-        const lotsHeld = existing.shares; // simple cap by share count proxy
-        const maxShares = bot.maxLotsPerTicker * Math.max(1, Math.floor(budget / price));
-        if (sharesToBuy > 0 && lotsHeld < maxShares) {
-          const costBeforeFee = sharesToBuy * price;
-          const costWithFee = costBeforeFee + bot.brokerCommission;
-          if (bot.cash >= costWithFee) {
-            bot.cash = parseFloat((bot.cash - costWithFee).toFixed(2));
-            const nextShares = existing.shares + sharesToBuy;
-            const nextAvg =
-              (existing.shares * existing.avgBuyPrice + costBeforeFee) / nextShares;
-            bot.holdings[cfg.ticker] = {
-              shares: nextShares,
-              avgBuyPrice: parseFloat(nextAvg.toFixed(2))
-            };
-            bot.trades.unshift({
-              id: `B${crypto.randomBytes(3).toString("hex").toUpperCase()}`,
-              timestamp: now.toISOString(),
-              ticker: cfg.ticker,
-              type: "BUY",
-              shares: sharesToBuy,
-              price,
-              total: parseFloat(costWithFee.toFixed(2)),
-              fee: bot.brokerCommission,
-              reason: `Buy limit <= $${cfg.buyLimit}`
-            });
-            anyChange = true;
+      // ---- BUY side: dip-buy with trend filter + cooldown ----
+      if (cooledDown && cfg.buyLimit > 0 && price <= cfg.buyLimit) {
+        // Trend filter: skip buying into a sharp short-term drop (falling knife)
+        const st = stocks.find(s => s.ticker === cfg.ticker);
+        let sharpDrop = false;
+        if (st && st.history.length >= 4) {
+          const h = st.history.map(x => x.price);
+          const recentTrend = (price - h[0]) / h[0];
+          if (recentTrend < -0.04) sharpDrop = true;
+        }
+        if (!sharpDrop) {
+          const existing = bot.holdings[cfg.ticker] || { shares: 0, avgBuyPrice: 0, peakPrice: price };
+          const equity = botEquity(bot);
+          const budget = (bot.positionSizePct / 100) * equity;
+          let sharesToBuy = Math.floor(budget / price);
+          if (sharesToBuy < 1) sharesToBuy = 0;
+          const maxShares = bot.maxLotsPerTicker * Math.max(1, Math.floor(budget / price));
+          if (sharesToBuy > 0 && existing.shares < maxShares) {
+            const costBeforeFee = sharesToBuy * price;
+            const costWithFee = costBeforeFee + bot.brokerCommission;
+            if (bot.cash >= costWithFee) {
+              bot.cash = parseFloat((bot.cash - costWithFee).toFixed(2));
+              const nextShares = existing.shares + sharesToBuy;
+              const nextAvg = (existing.shares * existing.avgBuyPrice + costBeforeFee) / nextShares;
+              bot.holdings[cfg.ticker] = {
+                shares: nextShares,
+                avgBuyPrice: parseFloat(nextAvg.toFixed(2)),
+                peakPrice: Math.max(existing.peakPrice ?? price, price)
+              };
+              bot.lastTradeAt[cfg.ticker] = now.toISOString();
+              bot.trades.unshift({
+                id: `B${crypto.randomBytes(3).toString("hex").toUpperCase()}`,
+                timestamp: now.toISOString(),
+                ticker: cfg.ticker,
+                type: "BUY",
+                shares: sharesToBuy,
+                price,
+                total: parseFloat(costWithFee.toFixed(2)),
+                fee: bot.brokerCommission,
+                reason: `Buy dip <= $${cfg.buyLimit}`
+              });
+              anyChange = true;
+            }
           }
         }
       }
@@ -1228,6 +1250,8 @@ app.get("/api/bot", authMiddleware, (req, res) => {
       takeProfitPct: bot.takeProfitPct,
       maxLotsPerTicker: bot.maxLotsPerTicker,
       adaptive: bot.adaptive,
+      trailingStopPct: bot.trailingStopPct,
+      tradeCooldownSec: bot.tradeCooldownSec,
       startedAt: bot.startedAt,
       tickers: Object.values(bot.tickers)
     },
@@ -1255,6 +1279,8 @@ app.post("/api/bot/config", authMiddleware, (req, res) => {
   if (typeof b.takeProfitPct === "number") bot.takeProfitPct = Math.min(500, Math.max(0, b.takeProfitPct));
   if (typeof b.maxLotsPerTicker === "number") bot.maxLotsPerTicker = Math.min(20, Math.max(1, Math.floor(b.maxLotsPerTicker)));
   if (typeof b.adaptive === "boolean") bot.adaptive = b.adaptive;
+  if (typeof b.trailingStopPct === "number") bot.trailingStopPct = Math.min(50, Math.max(0, b.trailingStopPct));
+  if (typeof b.tradeCooldownSec === "number") bot.tradeCooldownSec = Math.min(86400, Math.max(0, Math.floor(b.tradeCooldownSec)));
 
   if (Array.isArray(b.tickers)) {
     for (const t of b.tickers) {

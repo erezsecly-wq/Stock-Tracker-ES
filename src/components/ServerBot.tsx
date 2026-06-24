@@ -35,6 +35,8 @@ interface BotData {
     takeProfitPct: number;
     maxLotsPerTicker: number;
     adaptive: boolean;
+    trailingStopPct: number;
+    tradeCooldownSec: number;
     startedAt: string | null;
     tickers: TickerCfg[];
   };
@@ -73,7 +75,9 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
   const [stopLossPct, setStopLossPct] = useState(8);
   const [takeProfitPct, setTakeProfitPct] = useState(0);
   const [brokerCommission, setBrokerCommission] = useState(1.0);
-  const [adaptive, setAdaptive] = useState(false);
+  const [adaptive, setAdaptive] = useState(true);
+  const [trailingStopPct, setTrailingStopPct] = useState(4);
+  const [cooldownMin, setCooldownMin] = useState(15);
   const [tickers, setTickers] = useState<TickerCfg[]>([]);
   const [loadedOnce, setLoadedOnce] = useState(false);
   const [liveFeed, setLiveFeed] = useState(false);
@@ -97,6 +101,8 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
           setTakeProfitPct(b.config.takeProfitPct);
           setBrokerCommission(b.config.brokerCommission);
           setAdaptive(!!b.config.adaptive);
+          setTrailingStopPct(b.config.trailingStopPct ?? 4);
+          setCooldownMin(Math.round((b.config.tradeCooldownSec ?? 900) / 60));
           setTickers(b.config.tickers);
           setLoadedOnce(true);
         }
@@ -150,7 +156,8 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
         headers: { "Content-Type": "application/json", ...auth },
         body: JSON.stringify({
           startingCapital, positionSizePct, stopLossPct,
-          takeProfitPct, brokerCommission, adaptive, tickers
+          takeProfitPct, brokerCommission, adaptive, tickers,
+          trailingStopPct, tradeCooldownSec: cooldownMin * 60
         })
       });
       if (res.ok) flash("ההגדרות נשמרו בהצלחה");
@@ -301,6 +308,16 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
               <label className={lbl}>Take-Profit (% מעל עלות, 0=לפי סף מכירה)</label>
               <input type="number" className={input} value={takeProfitPct}
                 onChange={e => setTakeProfitPct(parseFloat(e.target.value) || 0)} />
+            </div>
+            <div>
+              <label className={lbl}>Trailing-Stop (% נעילת רווח מהשיא, 0=כבוי)</label>
+              <input type="number" className={input} value={trailingStopPct}
+                onChange={e => setTrailingStopPct(parseFloat(e.target.value) || 0)} />
+            </div>
+            <div>
+              <label className={lbl}>זמן המתנה בין עסקאות (דקות) — מונע over-trading</label>
+              <input type="number" className={input} value={cooldownMin}
+                onChange={e => setCooldownMin(parseFloat(e.target.value) || 0)} />
             </div>
             <div>
               <label className={lbl}>עמלת ברוקר לעסקה ($)</label>

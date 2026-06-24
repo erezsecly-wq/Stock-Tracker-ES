@@ -469,6 +469,15 @@ function makeDefaultBot(startingCapital = 5000): BotState {
   };
 }
 
+// Backfill newly-added fields onto bots saved by older versions, so the
+// upgraded engine never reads undefined values from an existing data file.
+for (const u of Object.keys(db.bots)) {
+  const existing = db.bots[u];
+  const def = makeDefaultBot(existing.startingCapital);
+  db.bots[u] = { ...def, ...existing };
+  if (!db.bots[u].lastTradeAt) db.bots[u].lastTradeAt = {};
+}
+
 // Global flag for connecting to real-market free provider (Yahoo Finance).
 // Restored from disk so the choice survives restarts/redeploys.
 let useLiveFeed = db.settings.useLiveFeed;

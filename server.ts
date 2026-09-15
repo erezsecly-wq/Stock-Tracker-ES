@@ -169,6 +169,18 @@ interface DatabaseSchema {
   settings: {
     useLiveFeed: boolean;
   };
+  // Last known real-market prices, persisted so a restart never resets the
+  // market back to the hard-coded seed values (which distorts bot equity).
+  marketCache?: {
+    [ticker: string]: {
+      price: number;
+      dailyChangePercent: number;
+      high24h: number;
+      low24h: number;
+      marketState?: string;
+      updatedAt: string;
+    };
+  };
 }
 
 // Initial default database structure
@@ -189,7 +201,21 @@ interface Stock {
   dailyChangePercent: number;
   high24h: number;
   low24h: number;
+  marketState?: string;   // Yahoo: PRE | REGULAR | POST | CLOSED (live feed only)
+  lastLiveUpdate?: string;
   history: { time: string; price: number }[];
+}
+
+const HISTORY_MAX = 120;
+
+// Compact factory for additional large-cap symbols. The seed price is only a
+// placeholder until the first real quote arrives (or the persisted cache loads).
+function mkStock(ticker: string, name: string, seed: number): Stock {
+  return {
+    ticker, name, currentPrice: seed, dailyChangePercent: 0,
+    high24h: seed, low24h: seed,
+    history: [{ time: "09:30", price: seed }, { time: "10:30", price: seed }, { time: "11:30", price: seed }]
+  };
 }
 
 const stocks: Stock[] = [
@@ -403,6 +429,33 @@ const stocks: Stock[] = [
   }
 ];
 
+// Broad universe of the market's strongest large caps (S&P 500 / Nasdaq-100
+// leaders by market cap). Symbols already seeded above are skipped.
+const EXTRA_UNIVERSE: [string, string, number][] = [
+  ["BRK-B", "Berkshire Hathaway", 480], ["AVGO", "Broadcom", 300], ["LLY", "Eli Lilly", 780],
+  ["JPM", "JPMorgan Chase", 300], ["V", "Visa", 350], ["MA", "Mastercard", 580],
+  ["UNH", "UnitedHealth", 300], ["XOM", "Exxon Mobil", 110], ["COST", "Costco", 950],
+  ["WMT", "Walmart", 100], ["HD", "Home Depot", 400], ["PG", "Procter & Gamble", 160],
+  ["JNJ", "Johnson & Johnson", 170], ["ORCL", "Oracle", 250], ["ABBV", "AbbVie", 210],
+  ["BAC", "Bank of America", 50], ["CRM", "Salesforce", 250], ["KO", "Coca-Cola", 70],
+  ["CVX", "Chevron", 155], ["PEP", "PepsiCo", 145], ["MRK", "Merck", 85],
+  ["ADBE", "Adobe", 350], ["CSCO", "Cisco", 70], ["ACN", "Accenture", 250],
+  ["MCD", "McDonald's", 300], ["LIN", "Linde", 470], ["TMO", "Thermo Fisher", 480],
+  ["INTC", "Intel", 25], ["QCOM", "Qualcomm", 160], ["TXN", "Texas Instruments", 200],
+  ["INTU", "Intuit", 650], ["AMAT", "Applied Materials", 190], ["MU", "Micron", 120],
+  ["GS", "Goldman Sachs", 700], ["CAT", "Caterpillar", 420], ["GE", "GE Aerospace", 280],
+  ["ISRG", "Intuitive Surgical", 480], ["NOW", "ServiceNow", 900], ["UBER", "Uber", 90],
+  ["BKNG", "Booking Holdings", 5500], ["SPGI", "S&P Global", 540], ["AXP", "American Express", 320],
+  ["TJX", "TJX Companies", 130], ["DIS", "Walt Disney", 110], ["PFE", "Pfizer", 25],
+  ["SHOP", "Shopify", 140], ["MRVL", "Marvell", 75], ["ANET", "Arista Networks", 130],
+  ["PANW", "Palo Alto Networks", 200], ["CRWD", "CrowdStrike", 450], ["SNOW", "Snowflake", 230],
+  ["MSTR", "MicroStrategy", 380], ["HOOD", "Robinhood", 110], ["SOFI", "SoFi", 25],
+  ["RKLB", "Rocket Lab", 45], ["IONQ", "IonQ", 45], ["SPY", "SPDR S&P 500 ETF", 650], ["QQQ", "Invesco QQQ ETF", 580]
+];
+for (const [t, n, seed] of EXTRA_UNIVERSE) {
+  if (!stocks.find(s => s.ticker === t)) stocks.push(mkStock(t, n, seed));
+}
+
 // ---------------------------------------------------------------------------
 // Persistence: a SINGLE in-memory DB is the source of truth (loaded once at
 // boot). All requests mutate this object directly, which eliminates the
@@ -422,7 +475,8 @@ function readDBFromDisk(): DatabaseSchema {
         portfolios: parsed.portfolios || {},
         logs: parsed.logs || {},
         bots: parsed.bots || {},
-        settings: parsed.settings || { useLiveFeed: false }
+        settings: parsed.settings || { useLiveFeed: false },
+        marketCache: parsed.marketCache || {}
       };
     }
   } catch (err) {
@@ -504,50 +558,126 @@ for (const u of Object.keys(db.bots)) {
 
 // Global flag for connecting to real-market free provider (Yahoo Finance).
 // Restored from disk so the choice survives restarts/redeploys.
-let useLiveFeed = db.settings.useLiveFeed;
+// In production the market data MUST be authentic: the simulated random-walk
+// prices make any long-running P&L test meaningless. Simulation stays available
+// for local development only (or if ALLOW_SIMULATION=true is set explicitly).
+const LIVE_FEED_FORCED = process.env.NODE_ENV === "production" && process.env.ALLOW_SIMULATION !== "true";
+let useLiveFeed = LIVE_FEED_FORCED ? true : (db.settings.useLiveFeed ?? true);
+if (LIVE_FEED_FORCED && !db.settings.useLiveFeed) {
+  db.settings.useLiveFeed = true;
+  persist();
+}
+
+// Restore last known real prices so a restart never rewinds the market to the
+// hard-coded seed values (which would silently re-value every bot holding).
+for (const st of stocks) {
+  const c = db.marketCache?.[st.ticker];
+  if (c && c.price > 0) {
+    st.currentPrice = c.price;
+    st.dailyChangePercent = c.dailyChangePercent;
+    st.high24h = c.high24h;
+    st.low24h = c.low24h;
+    st.marketState = c.marketState;
+    st.lastLiveUpdate = c.updatedAt;
+    st.history = [{ time: "--:--", price: c.price }];
+  }
+}
+
+// Live-feed health statistics (exposed on /api/health)
+const liveFeedStats = {
+  lastRunAt: null as string | null,
+  lastSuccessAt: null as string | null,
+  lastError: null as string | null,
+  okSymbols: 0,
+  failedSymbols: 0,
+  runs: 0
+};
+let liveFetchInFlight = false;
 const serverStartTime = new Date();
 let tickCount = 0;
 let lastTickTime = new Date().toISOString();
 
-// Async function to fetch live prices from FREE Yahoo Finance API
-async function updateStocksFromYahoo() {
-  for (const stock of stocks) {
-    try {
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${stock.ticker}?interval=1m&range=1d`;
-      const response = await fetch(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-        },
-        signal: AbortSignal.timeout(3000)
-      });
-      if (response.ok) {
-        const json = await response.json() as any;
-        const meta = json?.chart?.result?.[0]?.meta;
-        if (meta) {
-          const price = meta.regularMarketPrice;
-          const prevClose = meta.chartPreviousClose;
-          if (price) {
-            stock.currentPrice = parseFloat(price.toFixed(2));
-            if (prevClose) {
-              stock.dailyChangePercent = parseFloat((((price - prevClose) / prevClose) * 100).toFixed(2));
-            }
-            if (stock.currentPrice > stock.high24h) stock.high24h = stock.currentPrice;
-            if (stock.currentPrice < stock.low24h) stock.low24h = stock.currentPrice;
-            
-            const now = new Date();
-            const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
-            stock.history.push({ time: timeStr, price: stock.currentPrice });
-            if (stock.history.length > 20) {
-              stock.history.shift();
-            }
-          }
-        }
-      }
-    } catch (err: any) {
-      console.warn(`Yahoo Finance fetch bypassed or failed for ${stock.ticker}: ${err.message || err}`);
-    }
+// Fetch live prices from Yahoo Finance for ONE symbol.
+async function fetchYahooQuote(stock: Stock): Promise<boolean> {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(stock.ticker)}?interval=1m&range=1d`;
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Accept": "application/json"
+    },
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const json = await response.json() as any;
+  const meta = json?.chart?.result?.[0]?.meta;
+  const price = meta?.regularMarketPrice;
+  if (!meta || !price) throw new Error("no price in response");
+  const prevClose = meta.chartPreviousClose ?? meta.previousClose;
+  const now = new Date();
+  stock.currentPrice = parseFloat(Number(price).toFixed(2));
+  if (prevClose) {
+    stock.dailyChangePercent = parseFloat((((price - prevClose) / prevClose) * 100).toFixed(2));
   }
+  if (typeof meta.regularMarketDayHigh === "number") stock.high24h = meta.regularMarketDayHigh;
+  else if (stock.currentPrice > stock.high24h) stock.high24h = stock.currentPrice;
+  if (typeof meta.regularMarketDayLow === "number") stock.low24h = meta.regularMarketDayLow;
+  else if (stock.currentPrice < stock.low24h) stock.low24h = stock.currentPrice;
+  if (typeof meta.marketState === "string") stock.marketState = meta.marketState;
+  stock.lastLiveUpdate = now.toISOString();
+  const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+  const last = stock.history[stock.history.length - 1];
+  if (!last || last.price !== stock.currentPrice || stock.history.length < 3) {
+    stock.history.push({ time: timeStr, price: stock.currentPrice });
+    if (stock.history.length > HISTORY_MAX) stock.history.shift();
+  }
+  db.marketCache = db.marketCache || {};
+  db.marketCache[stock.ticker] = {
+    price: stock.currentPrice,
+    dailyChangePercent: stock.dailyChangePercent,
+    high24h: stock.high24h,
+    low24h: stock.low24h,
+    marketState: stock.marketState,
+    updatedAt: stock.lastLiveUpdate
+  };
+  return true;
 }
+
+// Refresh the whole universe from Yahoo in small parallel batches. Runs on its
+// own timer (independent of the 4s engine tick) so a slow provider can never
+// stall the trading engine, and so we stay polite with the free endpoint.
+async function updateStocksFromYahoo() {
+  if (liveFetchInFlight) return;
+  liveFetchInFlight = true;
+  liveFeedStats.runs++;
+  liveFeedStats.lastRunAt = new Date().toISOString();
+  let ok = 0, failed = 0;
+  let lastErr: string | null = null;
+  const BATCH = 5;
+  try {
+    for (let i = 0; i < stocks.length; i += BATCH) {
+      const batch = stocks.slice(i, i + BATCH);
+      const results = await Promise.allSettled(batch.map(st => fetchYahooQuote(st)));
+      results.forEach((r, j) => {
+        if (r.status === "fulfilled") ok++;
+        else { failed++; lastErr = `${batch[j].ticker}: ${r.reason?.message || r.reason}`; }
+      });
+      if (i + BATCH < stocks.length) await new Promise(r => setTimeout(r, 400));
+    }
+  } finally {
+    liveFetchInFlight = false;
+  }
+  liveFeedStats.okSymbols = ok;
+  liveFeedStats.failedSymbols = failed;
+  if (ok > 0) { liveFeedStats.lastSuccessAt = new Date().toISOString(); persist(); }
+  if (lastErr) { liveFeedStats.lastError = lastErr; console.warn(`[live-feed] ${failed} symbol(s) failed, e.g. ${lastErr}`); }
+}
+
+// 1-minute quotes are plenty for a strategy with a 15-minute trade cooldown,
+// and keep the request rate polite for a universe of ~70 symbols.
+const LIVE_FEED_INTERVAL_MS = 60000;
+setInterval(() => { if (useLiveFeed) updateStocksFromYahoo().catch(e => console.error("[live-feed]", e)); }, LIVE_FEED_INTERVAL_MS);
+// First refresh shortly after boot so the UI and the bot see real prices immediately
+setTimeout(() => { if (useLiveFeed) updateStocksFromYahoo().catch(e => console.error("[live-feed]", e)); }, 1500);
 
 function priceOf(ticker: string): number | null {
   const s = stocks.find(st => st.ticker === ticker);
@@ -626,6 +756,13 @@ function runTradingEngine() {
 
     for (const cfg of Object.values(bot.tickers)) {
       if (!cfg.enabled) continue;
+      // With real data, fills only happen while the exchange is open (like a
+      // real broker) and only on a quote we actually received from the provider.
+      if (useLiveFeed) {
+        const st = stocks.find(s => s.ticker === cfg.ticker);
+        if (!st || !st.lastLiveUpdate) continue;
+        if (st.marketState && st.marketState !== "REGULAR") continue;
+      }
       const price = priceOf(cfg.ticker);
       if (price === null) continue;
 
@@ -752,8 +889,7 @@ setInterval(async () => {
   lastTickTime = new Date().toISOString();
 
   if (useLiveFeed) {
-    // Live US market values connected to the free Yahoo Finance endpoint
-    await updateStocksFromYahoo();
+    // Real prices are refreshed by the independent live-feed timer above.
   } else {
     // Sandbox simulation: random fluctuation
     stocks.forEach(stock => {
@@ -766,7 +902,7 @@ setInterval(async () => {
       const now = new Date();
       const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
       stock.history.push({ time: timeStr, price: stock.currentPrice });
-      if (stock.history.length > 20) {
+      if (stock.history.length > HISTORY_MAX) {
         stock.history.shift();
       }
     });
@@ -842,6 +978,9 @@ app.get("/api/health", (req, res) => {
     tickCount,
     lastTickTime,
     useLiveFeed,
+    liveFeedForced: LIVE_FEED_FORCED,
+    liveFeed: { ...liveFeedStats, universeSize: stocks.length, intervalMs: LIVE_FEED_INTERVAL_MS,
+      sample: stocks.slice(0, 3).map(st => ({ ticker: st.ticker, price: st.currentPrice, marketState: st.marketState, lastLiveUpdate: st.lastLiveUpdate })) },
     db: { file: DB_FILE, exists: fs.existsSync(DB_FILE), writable: dbWritable },
     jwtSecretSource,
     bots: { total: Object.keys(db.bots).length, enabled: enabledBots.length },
@@ -850,11 +989,14 @@ app.get("/api/health", (req, res) => {
 });
 
 app.get("/api/config/live-feed", (req, res) => {
-  res.json({ useLiveFeed });
+  res.json({ useLiveFeed, forced: LIVE_FEED_FORCED });
 });
 
 app.post("/api/config/live-feed", (req, res) => {
   const { enabled } = req.body;
+  if (LIVE_FEED_FORCED && !enabled) {
+    return res.status(403).json({ error: "בסביבת הייצור המחירים תמיד אמיתיים (Yahoo Finance) — אי אפשר לעבור לסימולציה", useLiveFeed: true });
+  }
   useLiveFeed = !!enabled;
   db.settings.useLiveFeed = useLiveFeed;
   persist();
@@ -1367,6 +1509,17 @@ app.post("/api/bot/start", authMiddleware, (req, res) => {
   bot.trades = [];
   bot.equityCurve = [{ t: bot.startedAt, equity: bot.startingCapital }];
   bot.benchmarkBasis = null; // recaptured on first engine run
+  bot.lastTradeAt = {};
+  bot.lastAdaptAt = null;
+  // Re-anchor every buy/sell limit to the CURRENT real price so that limits
+  // computed against stale/simulated prices can never trigger phantom trades.
+  for (const cfg of Object.values(bot.tickers)) {
+    const p = priceOf(cfg.ticker);
+    if (p && p > 0) {
+      cfg.buyLimit = parseFloat((p * 0.97).toFixed(2));
+      cfg.sellLimit = parseFloat((p * 1.06).toFixed(2));
+    }
+  }
   persist();
   res.json({ success: true, startedAt: bot.startedAt });
 });

@@ -83,6 +83,7 @@ export default function ServerBot({ theme, themeVal, token, stocks, onUnauthoriz
   const [tickers, setTickers] = useState<TickerCfg[]>([]);
   const [loadedOnce, setLoadedOnce] = useState(false);
   const [liveFeed, setLiveFeed] = useState(false);
+  const [liveFeedForced, setLiveFeedForced] = useState(false);
   const [now, setNow] = useState(Date.now());
 
   const auth = { Authorization: `Bearer ${token}` };
@@ -124,7 +125,11 @@ export default function ServerBot({ theme, themeVal, token, stocks, onUnauthoriz
         setMetrics(m.metrics);
       }
       const lf = await fetch("/api/config/live-feed");
-      if (lf.ok) setLiveFeed(!!(await lf.json()).useLiveFeed);
+      if (lf.ok) {
+        const lfj = await lf.json();
+        setLiveFeed(!!lfj.useLiveFeed);
+        setLiveFeedForced(!!lfj.forced);
+      }
     } catch (e) {
       console.error("bot load error", e);
       setLoadError("אין תקשורת עם השרת — מנסה שוב...");
@@ -207,6 +212,10 @@ export default function ServerBot({ theme, themeVal, token, stocks, onUnauthoriz
       flash(next
         ? "📡 מחוברים למחירי שוק אמיתיים (Yahoo Finance) — מסחר מדומה לפי השוק האמיתי"
         : "🔌 חזרה למצב סימולציה (מחירים מדומים)");
+    } else {
+      try { flash((await res.json()).error || "לא ניתן לשנות את מקור הנתונים"); }
+      catch { flash("לא ניתן לשנות את מקור הנתונים"); }
+      setLiveFeed(true);
     }
   };
 
@@ -263,11 +272,11 @@ export default function ServerBot({ theme, themeVal, token, stocks, onUnauthoriz
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <button onClick={toggleLiveFeed}
+          <button onClick={toggleLiveFeed} disabled={liveFeedForced}
             className={`flex items-center gap-2 py-2.5 px-4 rounded-xl border text-sm font-bold transition-all ${liveFeed ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-400" : `${theme.border} ${theme.subCard}`}`}
-            title="חבר/נתק מחירי שוק אמיתיים (Yahoo Finance)">
+            title={liveFeedForced ? "בסביבת הייצור המחירים תמיד אמיתיים מ-Yahoo Finance" : "חבר/נתק מחירי שוק אמיתיים (Yahoo Finance)"}>
             <Wifi className={`w-4 h-4 ${liveFeed ? "text-emerald-400" : ""}`} />
-            {liveFeed ? "מחירים אמיתיים (LIVE)" : "מצב סימולציה"}
+            {liveFeed ? (liveFeedForced ? "מחירים אמיתיים (Yahoo Finance)" : "מחירים אמיתיים (LIVE)") : "מצב סימולציה"}
           </button>
           <button onClick={load} className={`p-2.5 rounded-xl border ${theme.border} ${theme.subCard} hover:opacity-80`} title="רענן">
             <RefreshCw className="w-4 h-4" />

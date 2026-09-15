@@ -32,3 +32,15 @@
   - App.tsx / AuthScreen.tsx / ServerBot.tsx: 401 → ניקוי הטוקן, חזרה למסך התחברות עם הודעה ברורה; ServerBot מבחין בין "לא נטען" ל"כבוי".
 - **קבצים**: server.ts, src/App.tsx, src/components/AuthScreen.tsx, src/components/ServerBot.tsx
 - **סטטוס**: tsc עבר ✓ (vite build לא רץ בסביבה זו — node_modules של Windows)
+
+## 2026-09-15 — Checkpoint #004 — נתוני שוק אמיתיים בלבד
+- **בעיה**: הבוט רץ 13 יום על מחירי סימולציה (random walk) שאינם נשמרים; ב-restart המחירים חזרו לערכי הסיד והאחזקות תומחרו מחדש (5,600 → 9,578). כל תוצאה במצב זה חסרת משמעות.
+- **פתרון** (server.ts):
+  - בייצור Live Feed כפוי (Yahoo Finance); סימולציה רק ב-dev או עם ALLOW_SIMULATION=true. POST להחלפה מחזיר 403.
+  - מחירים אחרונים נשמרים ב-DB (`marketCache`) ונטענים בעלייה — אין יותר איפוס ל-seed.
+  - שליפת Yahoo עברה לטיימר עצמאי (כל 60ש', batches מקביליים) במקום בתוך טיק ה-4ש'.
+  - מנוע המסחר סוחר רק על ציטוט אמיתי שהתקבל ורק כשהבורסה פתוחה (marketState=REGULAR).
+  - יקום מניות הורחב ל-~70 סימבולים (S&P/Nasdaq large caps + SPY/QQQ).
+  - `/api/bot/start` מאפס לימיטים לפי מחיר אמיתי נוכחי. `/api/health` מציג סטטיסטיקת live feed.
+- **פרונט** (ServerBot.tsx): כפתור הסימולציה מנוטרל בייצור ומציג "מחירים אמיתיים (Yahoo Finance)".
+- **סטטוס**: tsc עבר ✓

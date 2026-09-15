@@ -5,15 +5,16 @@ import { loginBiometric } from "../utils/webauthn";
 
 interface AuthScreenProps {
   onLoginSuccess: (username: string, token: string, biometricRegistered: boolean) => void;
+  initialError?: string | null;
 }
 
-export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
+export default function AuthScreen({ onLoginSuccess, initialError = null }: AuthScreenProps) {
   const [activeTab, setActiveTab] = useState<"signin" | "signup">("signin");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [isBiometricRegistered, setIsBiometricRegistered] = useState(false);
   const [showBioSensor, setShowBioSensor] = useState(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(initialError);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 

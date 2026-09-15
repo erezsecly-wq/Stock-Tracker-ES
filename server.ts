@@ -17,6 +17,10 @@ import {
 
 dotenv.config();
 
+// Resilience: keep the 24/7 server alive even if an unexpected error occurs.
+process.on("unhandledRejection", (e) => console.error("[unhandledRejection]", e));
+process.on("uncaughtException", (e) => console.error("[uncaughtException]", e));
+
 const app = express();
 app.set("trust proxy", 1); // needed for correct rate-limit behind hosting proxies (Render/Railway)
 const PORT = Number(process.env.PORT) || 3000;
@@ -26,16 +30,39 @@ app.use(express.json());
 // ---------------------------------------------------------------------------
 // Security / deployment configuration (all overridable via environment vars)
 // ---------------------------------------------------------------------------
-// JWT secret: MUST be set in production. A random per-boot secret is used as a
-// safe fallback in dev (invalidates tokens on restart, which is acceptable locally).
-const JWT_SECRET =
-  process.env.JWT_SECRET || crypto.randomBytes(48).toString("hex");
-if (!process.env.JWT_SECRET) {
-  console.warn(
-    "[security] JWT_SECRET not set - using a random per-boot secret. Set JWT_SECRET in production!"
-  );
+// Path to file-based persistent DB
+const DB_FILE = process.env.DB_FILE || path.join(process.cwd(), "data_store.json");
+
+// JWT secret: SHOULD be set via the JWT_SECRET env var in production.
+// If it is not set, we generate one ONCE and persist it next to the DB file so
+// that it survives restarts/deploys (a per-boot random secret would invalidate
+// every user's login on each restart, which looks like "the server went down").
+let jwtSecretSource: "env" | "file" | "ephemeral" = "env";
+function resolveJwtSecret(): string {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  const secretFile = path.join(path.dirname(DB_FILE), ".jwt_secret");
+  try {
+    if (fs.existsSync(secretFile)) {
+      const existing = fs.readFileSync(secretFile, "utf-8").trim();
+      if (existing.length >= 32) {
+        jwtSecretSource = "file";
+        console.warn(`[security] JWT_SECRET env not set - using persisted secret from ${secretFile}`);
+        return existing;
+      }
+    }
+    const generated = crypto.randomBytes(48).toString("hex");
+    fs.writeFileSync(secretFile, generated, { encoding: "utf-8", mode: 0o600 });
+    jwtSecretSource = "file";
+    console.warn(`[security] JWT_SECRET env not set - generated and persisted a secret at ${secretFile}. Set JWT_SECRET in production!`);
+    return generated;
+  } catch (err) {
+    jwtSecretSource = "ephemeral";
+    console.error("[security] JWT_SECRET not set AND could not persist a secret file - using a per-boot secret (all logins will be invalidated on restart!)", err);
+    return crypto.randomBytes(48).toString("hex");
+  }
 }
-const TOKEN_TTL = "7d";
+const JWT_SECRET = resolveJwtSecret();
+const TOKEN_TTL = "90d";
 
 // WebAuthn relying-party config. For local dev these defaults work as-is.
 // In production set RP_ID to your domain (e.g. 'myapp.com') and ORIGIN to the
@@ -43,9 +70,6 @@ const TOKEN_TTL = "7d";
 const RP_ID = process.env.RP_ID || "localhost";
 const RP_NAME = process.env.RP_NAME || "StockWise ES";
 const ORIGIN = process.env.ORIGIN || `http://localhost:${PORT}`;
-
-// Path to file-based persistent DB
-const DB_FILE = process.env.DB_FILE || path.join(process.cwd(), "data_store.json");
 
 // A registered WebAuthn (passkey / biometric) credential
 interface StoredCredential {
@@ -788,7 +812,7 @@ setInterval(async () => {
   });
 
   // Run the autonomous trading engine
-  if (runTradingEngine()) changed = true;
+  try { if (runTradingEngine()) changed = true; } catch (err) { console.error("[trading-engine]", err); }
 
   if (changed) persist();
 }, 4000);
@@ -799,7 +823,30 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", currentTime: new Date().toISOString() });
+  // Diagnostic health endpoint: lets you see at a glance whether the server
+  // restarted, whether the DB is really persisted to disk, and whether the
+  // 24/7 bots are actually running.
+  let dbWritable = false;
+  try {
+    const probe = path.join(path.dirname(DB_FILE), ".write_probe");
+    fs.writeFileSync(probe, String(Date.now()), "utf-8");
+    fs.unlinkSync(probe);
+    dbWritable = true;
+  } catch { dbWritable = false; }
+  const enabledBots = Object.keys(db.bots).filter(u => db.bots[u]?.enabled);
+  res.json({
+    status: "ok",
+    currentTime: new Date().toISOString(),
+    serverStartTime: serverStartTime.toISOString(),
+    uptimeSeconds: Math.floor((Date.now() - serverStartTime.getTime()) / 1000),
+    tickCount,
+    lastTickTime,
+    useLiveFeed,
+    db: { file: DB_FILE, exists: fs.existsSync(DB_FILE), writable: dbWritable },
+    jwtSecretSource,
+    bots: { total: Object.keys(db.bots).length, enabled: enabledBots.length },
+    users: Object.keys(db.users).length
+  });
 });
 
 app.get("/api/config/live-feed", (req, res) => {

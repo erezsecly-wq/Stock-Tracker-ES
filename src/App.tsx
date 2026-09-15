@@ -140,6 +140,7 @@ export default function App() {
     localStorage.setItem(`auth_token_${username}`, token);
     localStorage.setItem(`bio_reg_${username}`, String(biometricRegistered));
     setSession({ username, token, biometricRegistered });
+    setSessionExpiredMsg(null);
   };
 
   const handleLogout = () => {
@@ -147,6 +148,19 @@ export default function App() {
       localStorage.removeItem(`auth_token_${session.username}`);
     }
     setSession(null);
+  };
+
+  // Called whenever the server answers 401: the saved token is no longer valid
+  // (expired, or the server was restarted with a different secret). Instead of
+  // looping on failed requests forever, drop the stale token and ask the user
+  // to sign in again. The server-side bot keeps running regardless.
+  const [sessionExpiredMsg, setSessionExpiredMsg] = useState<string | null>(null);
+  const handleSessionExpired = () => {
+    if (session) {
+      localStorage.removeItem(`auth_token_${session.username}`);
+    }
+    setSession(null);
+    setSessionExpiredMsg("ההתחברות פגה או שהשרת עלה מחדש — יש להתחבר מחדש. הבוט בצד השרת ממשיך לרוץ.");
   };
 
   // Fetch Stocks data periodically (simulating active websocket or live API)
@@ -176,6 +190,7 @@ export default function App() {
       const alertsRes = await fetch("/api/alerts/config", {
         headers: { Authorization: `Bearer ${session.token}` }
       });
+      if (alertsRes.status === 401) { handleSessionExpired(); return; }
       if (alertsRes.ok) {
         const data = await alertsRes.json();
         setAlerts(data.configs);
@@ -506,7 +521,7 @@ export default function App() {
   const theme = getThemeClasses(themeVal);
 
   if (!session) {
-    return <AuthScreen onLoginSuccess={handleLoginSuccess} />;
+    return <AuthScreen onLoginSuccess={handleLoginSuccess} initialError={sessionExpiredMsg} />;
   }
 
   const selectedStock = stocks.find(s => s.ticker === selectedTicker);
@@ -1425,6 +1440,7 @@ export default function App() {
             themeVal={themeVal}
             token={session.token}
             stocks={stocks}
+            onUnauthorized={handleSessionExpired}
           />
         )}
 

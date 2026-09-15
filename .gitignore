@@ -8,3 +8,6 @@ coverage/
 !.env.example
 data_store.json
 data_store.json.tmp
+
+.checkpoints/
+CODE_REVIEW.md

@@ -16,6 +16,7 @@ interface ServerBotProps {
   themeVal: number;
   token: string;
   stocks: { ticker: string; currentPrice: number }[];
+  onUnauthorized?: () => void;
 }
 
 interface TickerCfg {
@@ -63,8 +64,9 @@ interface Metrics {
   enabled: boolean;
 }
 
-export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotProps) {
+export default function ServerBot({ theme, themeVal, token, stocks, onUnauthorized }: ServerBotProps) {
   const [data, setData] = useState<BotData | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -91,6 +93,16 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
         fetch("/api/bot", { headers: auth }),
         fetch("/api/bot/metrics", { headers: auth })
       ]);
+      if (bRes.status === 401 || mRes.status === 401) {
+        setLoadError("ההתחברות פגה — יש להתחבר מחדש כדי לראות את מצב הבוט");
+        onUnauthorized?.();
+        return;
+      }
+      if (!bRes.ok) {
+        setLoadError(`השרת החזיר שגיאה ${bRes.status} בטעינת מצב הבוט`);
+      } else {
+        setLoadError(null);
+      }
       if (bRes.ok) {
         const b: BotData = await bRes.json();
         setData(b);
@@ -115,6 +127,7 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
       if (lf.ok) setLiveFeed(!!(await lf.json()).useLiveFeed);
     } catch (e) {
       console.error("bot load error", e);
+      setLoadError("אין תקשורת עם השרת — מנסה שוב...");
     }
   }, [token, loadedOnce]);
 
@@ -234,9 +247,13 @@ export default function ServerBot({ theme, themeVal, token, stocks }: ServerBotP
               בוט מסחר אוטונומי 24/7 (צד שרת)
             </h3>
             <p className={`text-xs ${theme.textMuted}`}>
-              {running
-                ? `פעיל מאז ${data?.config.startedAt ? new Date(data.config.startedAt).toLocaleDateString("he-IL") : ""} · עברו ${elapsedSince(data?.config.startedAt || null)}`
-                : "כבוי — הגדר אסטרטגיה ולחץ הפעלה"}
+              {loadError
+                ? loadError
+                : !data
+                  ? "טוען את מצב הבוט מהשרת..."
+                  : running
+                    ? `פעיל מאז ${data?.config.startedAt ? new Date(data.config.startedAt).toLocaleDateString("he-IL") : ""} · עברו ${elapsedSince(data?.config.startedAt || null)}`
+                    : "כבוי — הגדר אסטרטגיה ולחץ הפעלה"}
             </p>
             {running && (
               <span className="inline-block mt-1 text-[11px] font-bold px-2 py-0.5 rounded-lg bg-cyan-500/15 text-cyan-400 border border-cyan-500/30">
